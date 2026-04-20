@@ -137,12 +137,15 @@ celerybeat.pid
 # Environments
 .env
 .envrc
-.venv
-env/
+.venv/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Local data files
+data/*
+data/data_parquet/*
 
 # Spyder project settings
 .spyderproject
