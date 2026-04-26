@@ -203,10 +203,10 @@ if __name__ == "__main__":
     # plot_continuous("dlycap", bins=50)
     # plot_continuous("prc", bins=50)
     # plot_continuous("dlycap", bins=50)
-    # plot_continuous("dlyret", bins=50)
+    plot_continuous("dlyret", bins=50)
 
     # Categorical examples:
-    plot_categorical("delactiontype", top_n=30)
+    # plot_categorical("dlyretmissflg", top_n=30)
     # plot_categorical("securitytype", top_n=30)
     # plot_categorical("sharetype", top_n=30)
     # plot_categorical("tradingstatusflg", top_n=30)
