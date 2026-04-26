@@ -201,3 +201,257 @@ The next step is not yet final universe construction. The next step is to create
 - preserves terminal/delisting rows separately for later backtest handling.
 
 Only after that should we construct the final daily tradable universe using rules such as price filters, liquidity filters, market-cap rank, ADV rank, common-stock filters, and minimum history requirements.
+
+
+## 6. Universe-preparation table construction
+
+After the initial missingness and abnormality investigation, we created a universe-preparation layer. This step is implemented in:
+
+```text
+src/prepare_universe_base.py
+```
+
+This script constructs three outputs:
+
+```text
+data/clean_parquet/daily_universe_prepare_all/
+data/clean_parquet/daily_universe_ready_base/
+data/clean_parquet/daily_terminal_events/
+```
+
+The purpose of this step is to separate data-quality preparation from final investment-universe construction.
+
+### 6.1 Full prepared table
+
+`daily_universe_prepare_all` keeps all rows from `daily_core` and adds diagnostic flags and basic derived variables. Important flags include:
+
+- trading-status and terminal-event flags, such as `is_active_trading_flag`, `non_tradable_status_flag`, and `terminal_event_flag`;
+- price-quality flags, such as `invalid_price_flag`, `zero_price_flag`, `high_price_flag`, `price_from_bidask_flag`, and `negative_raw_price_flag`;
+- OHLC flags, such as `has_ohlc_flag`, `ohlc_missing_flag`, `ohlc_inconsistent_flag`, and `ohlc_imputed_from_prc_flag`;
+- bid/ask flags, such as `bidask_missing_flag` and `valid_bidask_flag`;
+- return and liquidity flags, such as `return_missing_flag`, `invalid_volume_flag`, and `invalid_market_cap_flag`;
+- security/share metadata flags;
+- distribution and corporate-action event flags.
+
+The script also creates basic derived variables such as:
+
+```text
+log_prc
+log_dlycap
+dollar_volume = prc * dlyvol
+bid_ask_spread
+intraday_ret_strict
+intraday_range_strict
+intraday_ret_clean
+intraday_range_clean
+```
+
+The raw variables are preserved. The derived variables and flags are auxiliary variables for later universe construction and feature engineering.
+
+### 6.2 Universe-ready base table
+
+`daily_universe_ready_base` removes only stock-day rows that are structurally unsuitable as day-*t* trading candidates. The filtering rule is:
+
+```text
+is_active_trading_flag = 1
+non_tradable_status_flag = 0
+terminal_event_flag = 0
+invalid_price_flag = 0
+invalid_volume_flag = 0
+invalid_market_cap_flag = 0
+return_missing_flag = 0
+security_metadata_missing_flag = 0
+```
+
+This filter removes inactive, suspended, halted, terminal/delisting, missing-price, missing-volume, missing-market-cap, missing-return, and missing-essential-metadata rows. It does not apply final universe rules such as common-stock filters, price thresholds, market-cap rank, ADV rank, or minimum history requirements.
+
+This filtering uses only contemporaneous day-*t* information and therefore does not introduce look-ahead bias. Terminal and delisting rows are not deleted from the full prepared data; they are saved separately for later realized-return and backtest handling.
+
+### 6.3 Terminal-event table
+
+`daily_terminal_events` stores terminal or delisting-related rows separately. These rows should not be used as new trading candidates, but they may be needed later when computing realized returns for stocks selected before a terminal event.
+
+This separation avoids the following mistake:
+
+```text
+Use only future universe membership to compute realized returns.
+```
+
+Future realized returns should be computed from a broader return source, not only from future universe membership, to avoid survivorship bias.
+
+## 7. Duplicate stock-date diagnosis and treatment
+
+Before final universe construction, we diagnosed duplicate `(permno, dlycaldt)` rows in `daily_universe_ready_base` using:
+
+```text
+src/diagnose_universe_ready_base_duplicates.py
+```
+
+The duplicate diagnostic showed:
+
+| quantity | value |
+|---|---:|
+| total rows before duplicate handling | 15,469,047 |
+| unique stock-days | 15,466,218 |
+| duplicate stock-days | 2,789 |
+| extra duplicate rows | 2,829 |
+| maximum rows per stock-day | 3 |
+
+A follow-up diagnostic showed that duplicate rows did not differ in the core trading fields:
+
+```text
+dlyprc, prc, dlyret, dlyretx, dlyreti, dlyvol, dlycap,
+OHLC variables, dlybid, dlyask
+```
+
+The differences were concentrated in distribution metadata, especially:
+
+```text
+distype
+disseqnbr
+```
+
+This suggests that duplicates are mostly caused by multiple distribution-event records attached to the same stock-date, rather than by conflicting price/return observations.
+
+For the universe-ready base table, we require one row per stock-date. Therefore, `prepare_universe_base.py` was updated to preserve exactly one row for each `(permno, dlycaldt)` pair and remove the extra duplicate rows. The full prepared table still keeps the raw distribution-event records for auditability.
+
+## 8. Daily stock universe construction
+
+The daily stock universe was created from:
+
+```text
+data/clean_parquet/daily_universe_ready_base/
+```
+
+using:
+
+```text
+src/create_daily_universe.py
+```
+
+This script creates:
+
+```text
+data/clean_parquet/daily_stock_universe/
+data/clean_parquet/daily_stock_universe_daily_summary.csv
+data/clean_parquet/daily_stock_universe_yearly_summary.csv
+```
+
+The universe is constructed independently for each date. A stock is included in the daily universe if it satisfies the following conditions:
+
+| rule | reason |
+|---|---|
+| Start from `daily_universe_ready_base` | Remove structurally unusable stock-day rows before final universe construction. |
+| `securitytype = 'EQTY'` | Keep equity securities. |
+| `securitysubtype = 'COM'` | Keep common-stock-like equities. |
+| `sharetype = 'NS'` | Keep normal share type used for the common-stock universe. |
+| `usincflg = 'Y'` | Focus on U.S.-incorporated stocks. |
+| `shradrflg = 'N'` | Exclude ADRs. |
+| `primaryexch IN ('N', 'Q', 'A')` | Focus on major U.S. exchanges. |
+| `prc >= 5` | Exclude penny-stock-like names with severe microstructure noise and poor tradability. |
+| `adv20 >= 1,000,000` | Require minimum 20-day average dollar volume. |
+| `market_cap_rank <= 3000` | Keep a broad but reasonably investable market-cap universe. |
+| `adv20_rank <= 4000` | Remove the most illiquid tail while allowing liquidity rank to be looser than market-cap rank. |
+| `hist_ret_obs_252 >= 126` | Require roughly half a year of historical return observations for stable feature construction. |
+
+Here,
+
+```text
+adv20 = 20-day rolling average of dollar_volume
+dollar_volume = prc * dlyvol
+market_cap_rank = daily cross-sectional rank of dlycap, descending
+adv20_rank = daily cross-sectional rank of adv20, descending
+```
+
+The resulting universe contains 3,969,391 stock-day observations. This universe is intended to be the candidate set for later feature construction, prediction, and portfolio formation. It is not yet the final modeling table because labels and engineered features still need to be merged in.
+
+## 9. Universe-level missingness and abnormality checks
+
+After constructing `daily_stock_universe`, we scanned the universe table for missingness and abnormal values using:
+
+```text
+src/scan_universe_missing_abnormal.py
+```
+
+This produced:
+
+```text
+data/clean_parquet/daily_stock_universe_missing_abnormal_report.csv
+data/clean_parquet/daily_stock_universe_abnormal_examples.csv
+```
+
+Important results:
+
+| variable | missing count | missing percentage | interpretation |
+|---|---:|---:|---|
+| `prc` | 0 | 0.0000% | Good: all universe rows have usable price. |
+| `dlyret` | 0 | 0.0000% | Good: all universe rows have current daily return. |
+| `dlyretx` | 0 | 0.0000% | Good: all universe rows have current price return. |
+| `dlyreti` | 0 | 0.0000% | Good: all universe rows have current income-return component. |
+| `dollar_volume` | 0 | 0.0000% | Good: all universe rows have usable dollar volume. |
+| `adv20` | 0 | 0.0000% | Good: all universe rows have valid rolling dollar-volume history. |
+| `market_cap_rank` | 0 | 0.0000% | Good: all universe rows have valid market-cap rank. |
+| `adv20_rank` | 0 | 0.0000% | Good: all universe rows have valid ADV rank. |
+| `dlyclose`, `dlyhigh`, `dlylow` | 850 | about 0.0214% | Mostly bid/ask-priced observations without trade-based OHLC. |
+| `dlyopen` | 854 | about 0.0215% | Same as above, plus four rows where open is missing but other OHLC fields exist. |
+| `dlybid`, `dlyask` | 4 | about 0.0001% | Rare quote-field missingness. |
+| `bid_ask_spread` | 608 | about 0.0153% | Mostly caused by crossed quotes or invalid bid/ask ordering. |
+| `price_ohlc_consistency` | 1 | about 0.00003% | One OHLC consistency violation. |
+
+The universe is therefore usable for the next step. The remaining missingness is small and should be handled in feature engineering rather than by deleting stock-days from the universe.
+
+## 10. Universe edge-case diagnostics
+
+We then examined universe edge cases using:
+
+```text
+src/diagnose_universe_edge_case.py
+```
+
+This produced targeted diagnostics for OHLC missingness, bid/ask missingness, bid-ask spread missingness, OHLC consistency, and return-missing flags.
+
+Main findings:
+
+- There are 850 OHLC-missing rows with `dlyprcflg = BA`, meaning that the daily price is based on bid/ask rather than a trade-based OHLC record.
+- There are four additional rows where `dlyopen` is missing but `dlyclose`, `dlyhigh`, and `dlylow` are present.
+- The 608 missing `bid_ask_spread` values consist of:
+
+```text
+604 rows with ask < bid
+4 rows with bid or ask missing
+```
+
+- There is one OHLC consistency violation:
+
+```text
+2023-06-05, JOBY: open=5.72, high=6.09, low=5.76, close=5.99
+```
+
+Here `open < low`. This row should be kept for return/backtest purposes, but OHLC-derived features should be set to missing or flagged for this stock-date.
+
+- There are three non-missing `dlyretmissflg` rows with value `MV`, but `dlyret` itself is present. These should not be used as a universe filter.
+
+- High-price abnormal values are due to valid high-priced stocks such as Berkshire Hathaway Class A. These should not be removed. Raw price should not be used directly as a model feature; log or cross-sectional rank transformations are preferred.
+
+## 11. Current conclusions and next step
+
+The cleaned universe is now ready for label and feature construction.
+
+Current decisions:
+
+- Keep OHLC-missing rows in the universe.
+- Keep the four bid/ask-missing rows in the universe.
+- Keep the one OHLC-inconsistent row in the universe, but invalidate OHLC-derived features for that row.
+- Keep high-price stocks such as Berkshire Hathaway Class A.
+- Do not use raw `prc` directly as an alpha feature; use log, rank, or normalized transformations.
+- Compute OHLC-derived features only when OHLC fields are complete and internally consistent.
+- Compute bid-ask-spread features only when `dlybid > 0`, `dlyask > 0`, and `dlyask >= dlybid`.
+- Use missingness and validity indicators as candidate model features.
+
+The next planned step is response-variable construction. The recommended approach is to create labels from a broad return source such as `daily_core` or `daily_universe_prepare_all`, not from future universe membership. The main target should be a future compounded total return, such as:
+
+```text
+target_5d_raw(t) = product_{k=1}^5 (1 + dlyret(t+k)) - 1
+```
+
+Then the label table can be merged onto `daily_stock_universe` by `(permno, dlycaldt)`. This avoids survivorship bias because future realized returns will not be conditioned on whether a stock remains in the future universe.

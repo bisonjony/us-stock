@@ -433,37 +433,60 @@ TO '{OUT_ALL}'
 # ---------------------------------------------------------------------
 # Step 3. Save universe-ready base table.
 # This is NOT the final universe.
-# It only removes structurally unusable stock-date rows:
-#   - not active
-#   - terminal/delisting event rows
-#   - missing/invalid price
-#   - missing/invalid volume
-#   - missing/invalid market cap
-#   - missing current return
-#   - missing essential security/share metadata
 #
-# We intentionally do NOT apply:
-#   - price >= 5
-#   - top N market cap
-#   - ADV ranking
-#   - common-stock-only filter
-#   - minimum history length
+# Important:
+#   daily_core / daily_universe_prepare_all may contain multiple rows
+#   for the same (permno, dlycaldt), usually because there are multiple
+#   distribution-event records on the same stock-date.
+#
+# For universe creation and modeling, we need one row per stock-date.
+# Diagnostics show that duplicate rows do not differ in core trading fields
+# such as price, return, volume, market cap, OHLC, bid, or ask. They mainly
+# differ in distribution metadata such as distype and disseqnbr.
+#
+# Therefore:
+#   - keep all rows in daily_universe_prepare_all for auditability;
+#   - deduplicate only daily_universe_ready_base.
 # ---------------------------------------------------------------------
 
 con.execute(f"""
 COPY (
-    SELECT *
-    FROM prepared_all
-    WHERE is_active_trading_flag = 1
-      AND non_tradable_status_flag = 0
-      AND terminal_event_flag = 0
+    WITH universe_ready_filtered AS (
+        SELECT *
+        FROM prepared_all
+        WHERE is_active_trading_flag = 1
+          AND non_tradable_status_flag = 0
+          AND terminal_event_flag = 0
 
-      AND invalid_price_flag = 0
-      AND invalid_volume_flag = 0
-      AND invalid_market_cap_flag = 0
+          AND invalid_price_flag = 0
+          AND invalid_volume_flag = 0
+          AND invalid_market_cap_flag = 0
 
-      AND return_missing_flag = 0
-      AND security_metadata_missing_flag = 0
+          AND return_missing_flag = 0
+          AND security_metadata_missing_flag = 0
+    ),
+
+    universe_ready_dedup AS (
+        SELECT *
+        FROM (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY permno, dlycaldt
+                    ORDER BY raw_row_id
+                ) AS duplicate_row_number,
+
+                COUNT(*) OVER (
+                    PARTITION BY permno, dlycaldt
+                ) AS n_rows_same_stock_day
+            FROM universe_ready_filtered
+        )
+        WHERE duplicate_row_number = 1
+    )
+
+    SELECT
+        * EXCLUDE (duplicate_row_number)
+    FROM universe_ready_dedup
 )
 TO '{OUT_BASE}'
 (FORMAT PARQUET, PARTITION_BY (year), COMPRESSION ZSTD);
