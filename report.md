@@ -1,12 +1,50 @@
+# U.S. Stock Daily Data Processing and Modeling Pipeline Report
+
+This report summarizes the data-processing and modeling-data construction pipeline for the U.S. stock daily dataset from 2019 to 2025-12-31. The goal is to build a daily cross-sectional stock-return prediction project using engineered alpha features and a LightGBM model, with later evaluation through IC, Sharpe, PnL, and backtesting metrics.
+
+## Table of Contents
+
+- [Data processing](#data-processing)
+  - [1. Raw CSV to Parquet conversion](#1-raw-csv-to-parquet-conversion)
+  - [2. Type conversion](#2-type-conversion-and-daily_core-construction)
+  - [3. Missingness and abnormal-value scan](#3-missingness-and-abnormal-value-scan)
+  - [4. Missingness and abnormality investigation](#4-missingness-and-abnormality-investigation)
+  - [5. Duplicate stock-date removal](#5-duplicate-stock-date-removal)
+- [Universe construction](#universe-construction)
+  - [1. Universe source table](#1-universe-source-table)
+  - [2. Daily universe rules](#2-daily-universe-rules)
+  - [3. Universe-level missingness checks](#3-universe-level-missingness-checks)
+  - [4. Universe edge-case diagnostics](#4-universe-edge-case-diagnostics)
+  - [5. Universe decision summary](#5-universe-decision-summary)
+- [Label and backtesting data creation](#label-and-backtesting-data-creation)
+  - [1. Response variable choice](#1-response-variable-choice)
+  - [2. Return source and survivorship-bias control](#2-return-source-and-survivorship-bias-control)
+  - [3. Missing forward returns](#3-missing-forward-returns)
+  - [4. Backtesting return definitions](#4-backtesting-return-definitions)
+- [Feature engineering](#feature-engineering)
+  - [1. Feature source and timing](#1-feature-source-and-timing)
+  - [2. Basic validity and event flags](#2-basic-validity-and-event-flags)
+  - [3. Return-history features](#3-return-history-features)
+  - [4. Volatility and downside-risk features](#4-volatility-and-downside-risk-features)
+  - [5. Liquidity and volume features](#5-liquidity-and-volume-features)
+  - [6. Price-pressure features](#6-price-pressure-features)
+  - [7. Optional features excluded from the first baseline](#7-optional-features-excluded-from-the-first-baseline)
+- [Model panel construction](#model-panel-construction)
+  - [1. Model-panel joins](#1-model-panel-joins)
+  - [2. Label filtering](#2-label-filtering)
+  - [3. Cross-sectional normalization](#3-cross-sectional-normalization)
+  - [4. Final model-panel columns](#4-final-model-panel-columns)
+- [Planned first LightGBM experiment](#planned-first-lightgbm-experiment)
+
 # Data processing
 
-This document summarizes the data-processing work completed so far for the U.S. stock daily dataset. The goal of these steps is to convert the raw data into a reliable typed daily panel, diagnose missing and abnormal values, and prepare the data for later universe construction, feature engineering, model training, and backtesting.
+The data-processing stage converts the raw 8 GB CSV into a typed and queryable daily panel. The goal of this stage is not to build the final model table, but to create a reliable base dataset for universe construction, feature engineering, label construction, and backtesting.
 
 ## 1. Raw CSV to Parquet conversion
 
-The raw U.S. stock daily data from 2019--2026 was originally stored as a large CSV file. Since the file is too large to load directly into pandas, we first converted it into separate Parquet files for efficient downstream processing.
+The raw U.S. stock daily data was originally stored as one large CSV file. Since the file is too large to load directly into pandas, we first converted it into multiple Parquet files.
 
-The conversion step is implemented in:
+Script:
 
 ```text
 src/csv_to_parquet.py
@@ -27,116 +65,86 @@ to:
 data/data_parquet/us_stock_19_26_raw_part_0052.parquet
 ```
 
-- Read all variables as `String` during this first conversion step.
-- Avoid pandas automatic type inference at this stage because columns such as CUSIP-like identifiers and CRSP flags may contain mixed representations.
-- Avoid date/time conversion at this stage to prevent conversion errors and preserve raw values.
+- Read all variables as strings during this first conversion step.
+- Avoid pandas automatic type inference because identifier and flag columns such as CUSIP-like fields, CRSP flags, and exchange variables can contain mixed representations.
+- Avoid date/time conversion during this step so that raw values are preserved for controlled casting later.
 
-This step produces a memory-safe raw Parquet archive that can be queried efficiently by DuckDB.
+This step creates a memory-safe raw Parquet archive that DuckDB can scan efficiently.
 
 ## 2. Type conversion and `daily_core` construction
 
-After the raw Parquet files were created, we used DuckDB SQL queries to process the data and construct a typed `daily_core` table.
+After raw Parquet conversion, we used DuckDB SQL to cast each variable to its intended type and construct a typed `daily_core` table.
 
-The processing step is implemented in:
+Script:
 
 ```text
 src/build_daily_core.py
 ```
 
-Main tasks in this step:
+Main tasks:
 
 - Read all 52 raw Parquet files using DuckDB.
 - Normalize variable names to lowercase.
-- Use the CRSP variable dictionary to assign each variable to an intended type, such as:
-  - integer
-  - decimal / double
-  - date
-  - character
-- Cast each variable from raw string format into its intended type.
+- Use the CRSP variable dictionary to assign intended types such as integer, double/decimal, date, and character.
+- Cast each raw string column into its intended type.
 - Preserve all original variables from the raw data.
-- Keep the raw CRSP price variable `dlyprc` unchanged.
-<!-- - Create a cleaned price magnitude variable:
+- Preserve the raw CRSP price field `dlyprc`.
+- Create a price magnitude variable `prc` from `dlyprc` for downstream analysis and universe construction.
+- Add a flag for negative raw CRSP prices, because negative CRSP prices are a data convention rather than economically negative prices.
 
-```text
-prc = ABS(dlyprc)
-```
+For casting failures, non-empty raw values that failed conversion would be saved separately for manual inspection. In the actual run, all casting was successful.
 
-- Add a flag indicating whether the raw CRSP price was negative:
-
-```text
-dlyprc_negative_flag
-```
-
-This is important because negative CRSP prices are often a data convention indicating bid/ask average prices, not economically negative prices. -->
-
-For casting failures:
-
-- If a non-empty raw value failed to cast into the intended type, the row would be saved separately for manual inspection.
-- In the actual run, all casting was successful.
-
-Output from this step:
+Output:
 
 ```text
 data/clean_parquet/daily_core/
 ```
 
-The resulting `daily_core` table is a typed, mostly lossless daily stock panel. It is not yet filtered into a trading universe.
+The resulting `daily_core` table is a typed, mostly lossless daily stock panel. It is not yet a trading universe.
 
 ## 3. Missingness and abnormal-value scan
 
-After constructing `daily_core`, we scanned each variable for missing values and abnormal values.
+After constructing `daily_core`, we scanned each variable for missingness and abnormal values.
 
-This step is implemented in:
+Script:
 
 ```text
 src/scan_missing_abnormal.py
 ```
 
-Main tasks in this step:
-
-- Use DuckDB to scan the full `daily_core` table.
-- For each variable, compute:
-  - total number of rows
-  - missing count
-  - missing percentage
-  - abnormal count
-  - abnormal percentage
-  - abnormal rule used, if applicable
-- Save the resulting summary table as:
+Main outputs:
 
 ```text
 data/clean_parquet/daily_core_missing_abnormal_report.csv
 ```
 
-Selected rows from the missing/abnormal report:
+For each variable, the scan reports:
 
-| variable | type | total rows | missing count | missing % | abnormal count | abnormal % | abnormal rule |
-|---|---|---:|---:|---:|---:|---:|---|
-| `disfacpr` | decimal | 15,749,137 | 15,553,778 | 98.7596% | 5,986 | 0.0380% | `disfacpr < 0` |
-| `disfacshr` | decimal | 15,749,137 | 15,553,778 | 98.7596% | 5,985 | 0.0380% | `disfacshr < 0` |
-| `dlyprc` | decimal | 15,749,137 | 47,018 | 0.2985% | 5,426 | 0.0345% | `ABS(dlyprc) <= 0 OR ABS(dlyprc) > 100000` |
-| `prc` | decimal | 15,749,137 | 47,018 | 0.2985% | 5,426 | 0.0345% | `prc <= 0 OR prc > 100000` |
-| `dlyclose` | decimal | 15,749,137 | 386,149 | 2.4519% | 1,760 | 0.0112% | `dlyclose <= 0 OR dlyclose > 100000` |
-| `dlylow` | decimal | 15,749,137 | 386,149 | 2.4519% | 1,760 | 0.0112% | `dlylow <= 0 OR dlylow > 100000` |
-| `dlyhigh` | decimal | 15,749,137 | 386,149 | 2.4519% | 1,760 | 0.0112% | `dlyhigh <= 0 OR dlyhigh > 100000` |
-| `dlyopen` | decimal | 15,749,137 | 386,146 | 2.4519% | 1,760 | 0.0112% | `dlyopen <= 0 OR dlyopen > 100000` |
-| `dlyask` | decimal | 15,749,137 | 51,628 | 0.3278% | 1,760 | 0.0112% | `dlyask < 0 OR dlyask > 100000` |
-| `dlybid` | decimal | 15,749,137 | 51,625 | 0.3278% | 1,760 | 0.0112% | `dlybid < 0 OR dlybid > 100000` |
-| `dlyret` | decimal | 15,749,137 | 54,680 | 0.3472% | 2 | 0.000013% | `dlyret < -1 OR dlyret > 20` |
-| `dlyretx` | decimal | 15,749,137 | 54,680 | 0.3472% | 2 | 0.000013% | `dlyretx < -1 OR dlyretx > 20` |
-| `disdivamt` | decimal | 15,749,137 | 15,556,843 | 98.7790% | 1 | 0.000006% | `disdivamt < 0` |
-| `dlynumtrd` | int | 15,749,137 | 9,039,956 | 57.3997% | 0 | 0.0000% | `dlynumtrd < 0` |
-| `exchangetier` | char | 15,749,137 | 9,035,459 | 57.3711% | 0 | 0.0000% | none |
-| `dlymmcnt` | int | 15,749,137 | 9,035,459 | 57.3711% | 0 | 0.0000% | `dlymmcnt < 0` |
-| `shareclass` | char | 15,749,137 | 14,096,039 | 89.5036% | 0 | 0.0000% | none |
+- total number of rows,
+- missing count,
+- missing percentage,
+- abnormal count,
+- abnormal percentage,
+- abnormal rule used.
 
-This scan gives a global view of missingness and abnormality, but it does not by itself determine whether a value is invalid. Many missing values are structural, especially for event-specific variables such as distribution and delisting fields.
+Selected results from the scan:
+
+| variable | total rows | missing count | missing % | abnormal count | abnormal % | interpretation |
+|---|---:|---:|---:|---:|---:|---|
+| `dlyprc` / `prc` | 15,749,137 | 47,018 | 0.2985% | 5,426 | 0.0345% | Missing/zero prices are mostly non-tradable or terminal rows; very high prices include valid stocks such as BRK.A. |
+| `dlyopen`, `dlyhigh`, `dlylow`, `dlyclose` | 15,749,137 | about 386,000 | about 2.45% | 1,760 | about 0.011% | OHLC missingness is often structural and related to non-trading or quote-priced rows. |
+| `dlybid`, `dlyask` | 15,749,137 | about 51,600 | about 0.328% | 1,760 | about 0.011% | Mostly non-tradable or abnormal quote records. |
+| `dlyret`, `dlyretx` | 15,749,137 | 54,680 | 0.3472% | 2 | 0.000013% | Missing returns are explained by CRSP return-missing flags. |
+| distribution variables | 15,749,137 | about 98.7% missing | high | low | low | Distribution fields are event-specific; missing usually means no distribution event. |
+| `dlynumtrd`, `dlymmcnt`, `exchangetier` | 15,749,137 | about 57% missing | high | 0 | 0% | These fields have limited coverage and should be optional, not mandatory. |
+
+This scan provided a global view. It did not by itself determine whether a value was unusable, because many missing values are structural rather than errors.
 
 ## 4. Missingness and abnormality investigation
 
-After generating the missing/abnormal report, we manually investigated the reason for missingness and abnormality for important variable groups.
+We then manually investigated missingness and abnormal values for key variable groups.
 
-This step is implemented in:
+Script:
 
 ```text
 src/investigate_missing_examples.py
@@ -144,192 +152,82 @@ src/investigate_missing_examples.py
 
 The investigation script supports:
 
-- Randomly sampling rows where a given variable is missing.
-- Printing all columns for each sampled row so that the surrounding context can be inspected.
-- Summarizing missingness by groups such as:
-  - `year`
-  - `primaryexch`
-  - `securitytype`
-  - `sharetype`
-  - `tradingstatusflg`
-- Randomly sampling abnormal rows for a given variable.
-- Saving both examples and grouped summaries to CSV files.
+- random sampling of rows where a variable is missing,
+- printing all columns for sampled rows,
+- grouped missingness summaries by variables such as `year`, `primaryexch`, `securitytype`, `sharetype`, and `tradingstatusflg`,
+- abnormal-example extraction,
+- CSV export for manual inspection.
 
-The detailed investigation reports are stored in:
+Detailed reports:
 
 ```text
 missing_investigation.md
 abnormal_investigation.md
 ```
 
-Main conclusions from the missingness investigation:
+Main conclusions:
 
-- OHLC variables (`dlyopen`, `dlyhigh`, `dlylow`, `dlyclose`) are often missing together. Many of these rows still have valid `dlyprc`, especially when the price comes from bid/ask quotes. These rows should generally be kept with indicators rather than dropped automatically.
-- Missing `prc` is more serious because `prc = ABS(dlyprc)`. Rows with missing or zero `prc` generally cannot be used as day-*t* trading candidates.
-- Missing bid/ask variables are mostly concentrated in inactive, suspended, halted, or delisting rows. For active rows, bid/ask missingness is rare and can be handled with a missingness flag.
-- Missing `dlyvol`, `dlycap`, and `dlyprcvol` is rare and mostly occurs in non-tradable or terminal rows. These variables are essential for universe preparation, so rows missing them are not suitable as trading candidates.
-- Missing return variables (`dlyret`, `dlyretx`, `dlyreti`) are mostly associated with non-trading or inactive rows. Active rows with missing returns should not have returns imputed as zero.
-- Variables such as `dlynumtrd`, `dlymmcnt`, and `exchangetier` have high missingness, but this reflects limited field coverage rather than data failure. They should be optional microstructure variables, not mandatory universe filters.
-- Distribution-event variables are mostly missing because most stock-date rows do not have a dividend, split, or other distribution event. Missingness should generally be interpreted as no recorded event.
-- Delisting-related variables are event metadata and should not be used as mandatory filters by themselves.
+- OHLC variables are often missing together. Many such rows still have valid `dlyprc`, especially when the price is based on bid/ask quotes. These rows should generally be kept and handled with feature-level indicators rather than automatically dropped.
+- Missing `prc` is more serious because `prc` is required for tradability, market-cap logic, and dollar-volume logic.
+- Missing bid/ask fields are mostly concentrated in inactive, suspended, halted, or delisting rows. In the final universe, bid/ask missingness is very rare.
+- Missing `dlyvol`, `dlycap`, and `dlyprcvol` is mostly associated with non-tradable or terminal rows. `dlyvol` and `dlycap` are essential for universe construction.
+- Missing return variables are mostly associated with non-trading or inactive rows. Active rows with missing returns should not be imputed as zero.
+- Distribution-event variables are mostly missing because most stock-days do not have dividends, splits, or other distribution events. Missingness should generally be interpreted as no recorded event.
+- Abnormal high `prc` values are not automatically errors; valid high-priced stocks such as Berkshire Hathaway Class A can exceed simple abnormal thresholds.
+- Extreme `dlyret` values were rare and internally explainable by major price changes. They are kept in the raw return source.
 
-Main conclusions from the abnormal-value investigation:
+## 5. Duplicate stock-date removal
 
-- Abnormal `dlyprc` values split into two cases: zero-price terminal/delisting rows and valid high-priced active equities. High prices above 100,000 should not be treated as invalid by themselves.
-- Negative `disfacpr` values are usually legitimate corporate-action records, including delisting distributions and reverse-split-style events.
-- The two abnormal `dlyret` rows are internally consistent extreme price jumps and should be preserved in `daily_core`; they may need special handling during model training.
-- The single negative `disdivamt` row appears to be a corporate-action adjustment record, not a systematic data-quality problem.
+Before label construction and feature engineering, we created a de-duplicated core table with exactly one row per stock-date pair.
 
-The purpose of this investigation was not to directly build the final universe. Instead, it determined how each type of missing or abnormal value should be handled later during universe preparation, feature engineering, model training, and backtesting.
-
-## 5. Current state before universe construction
-
-At this point, the data has been converted, typed, and diagnosed.
-
-The current clean base table is:
+Script:
 
 ```text
-data/clean_parquet/daily_core/
+src/label_creation_screening.py
 ```
 
-The next step is not yet final universe construction. The next step is to create a universe-preparation table that:
-
-- keeps raw information from `daily_core`,
-- creates indicator variables for important missingness and abnormality patterns,
-- creates basic derived variables such as `dollar_volume`, `log_prc`, and bid-ask spread,
-- removes only structurally unusable rows from the universe-ready base,
-- preserves terminal/delisting rows separately for later backtest handling.
-
-Only after that should we construct the final daily tradable universe using rules such as price filters, liquidity filters, market-cap rank, ADV rank, common-stock filters, and minimum history requirements.
-
-
-## 6. Universe-preparation table construction
-
-After the initial missingness and abnormality investigation, we created a universe-preparation layer. This step is implemented in:
+Output:
 
 ```text
-src/prepare_universe_base.py
+data/clean_parquet/daily_core_dup_removed/
 ```
 
-This script constructs three outputs:
+The script preserves the first occurrence of each `(permno, dlycaldt)` pair and removes extra duplicate rows. This is necessary because some duplicate stock-date pairs arise from multiple distribution-event records attached to the same stock-day. Diagnostics showed that duplicated rows did not differ in core trading fields such as price, return, volume, market cap, OHLC, bid, or ask; differences were mainly in distribution metadata such as `distype` and `disseqnbr`.
+
+This de-duplicated table is now the central broad source for:
+
+- daily universe construction,
+- backtesting label construction,
+- time-series feature engineering.
+
+# Universe construction
+
+Universe construction creates the daily tradable candidate set. This is separate from feature engineering and label construction. The universe should be determined using only information available on or before date `t`.
+
+## 1. Universe source table
+
+The active universe workflow now starts directly from:
 
 ```text
-data/clean_parquet/daily_universe_prepare_all/
-data/clean_parquet/daily_universe_ready_base/
-data/clean_parquet/daily_terminal_events/
+data/clean_parquet/daily_core_dup_removed/
 ```
 
-The purpose of this step is to separate data-quality preparation from final investment-universe construction.
+The previous intermediate `prepare_universe_base.py` workflow has been retired. We no longer maintain `daily_universe_prepare_all`, `daily_universe_ready_base`, or `daily_terminal_events` as active pipeline dependencies. The functionality we need is now covered by:
 
-### 6.1 Full prepared table
+- `daily_core_dup_removed` for de-duplicated broad daily data,
+- `create_daily_universe.py` for universe construction,
+- `create_features.py` for feature-level flags and engineered features,
+- `create_backtesting_data.py` for future-return and backtesting labels.
 
-`daily_universe_prepare_all` keeps all rows from `daily_core` and adds diagnostic flags and basic derived variables. Important flags include:
+## 2. Daily universe rules
 
-- trading-status and terminal-event flags, such as `is_active_trading_flag`, `non_tradable_status_flag`, and `terminal_event_flag`;
-- price-quality flags, such as `invalid_price_flag`, `zero_price_flag`, `high_price_flag`, `price_from_bidask_flag`, and `negative_raw_price_flag`;
-- OHLC flags, such as `has_ohlc_flag`, `ohlc_missing_flag`, `ohlc_inconsistent_flag`, and `ohlc_imputed_from_prc_flag`;
-- bid/ask flags, such as `bidask_missing_flag` and `valid_bidask_flag`;
-- return and liquidity flags, such as `return_missing_flag`, `invalid_volume_flag`, and `invalid_market_cap_flag`;
-- security/share metadata flags;
-- distribution and corporate-action event flags.
-
-The script also creates basic derived variables such as:
-
-```text
-log_prc
-log_dlycap
-dollar_volume = prc * dlyvol
-bid_ask_spread
-intraday_ret_strict
-intraday_range_strict
-intraday_ret_clean
-intraday_range_clean
-```
-
-The raw variables are preserved. The derived variables and flags are auxiliary variables for later universe construction and feature engineering.
-
-### 6.2 Universe-ready base table
-
-`daily_universe_ready_base` removes only stock-day rows that are structurally unsuitable as day-*t* trading candidates. The filtering rule is:
-
-```text
-is_active_trading_flag = 1
-non_tradable_status_flag = 0
-terminal_event_flag = 0
-invalid_price_flag = 0
-invalid_volume_flag = 0
-invalid_market_cap_flag = 0
-return_missing_flag = 0
-security_metadata_missing_flag = 0
-```
-
-This filter removes inactive, suspended, halted, terminal/delisting, missing-price, missing-volume, missing-market-cap, missing-return, and missing-essential-metadata rows. It does not apply final universe rules such as common-stock filters, price thresholds, market-cap rank, ADV rank, or minimum history requirements.
-
-This filtering uses only contemporaneous day-*t* information and therefore does not introduce look-ahead bias. Terminal and delisting rows are not deleted from the full prepared data; they are saved separately for later realized-return and backtest handling.
-
-### 6.3 Terminal-event table
-
-`daily_terminal_events` stores terminal or delisting-related rows separately. These rows should not be used as new trading candidates, but they may be needed later when computing realized returns for stocks selected before a terminal event.
-
-This separation avoids the following mistake:
-
-```text
-Use only future universe membership to compute realized returns.
-```
-
-Future realized returns should be computed from a broader return source, not only from future universe membership, to avoid survivorship bias.
-
-## 7. Duplicate stock-date diagnosis and treatment
-
-Before final universe construction, we diagnosed duplicate `(permno, dlycaldt)` rows in `daily_universe_ready_base` using:
-
-```text
-src/diagnose_universe_ready_base_duplicates.py
-```
-
-The duplicate diagnostic showed:
-
-| quantity | value |
-|---|---:|
-| total rows before duplicate handling | 15,469,047 |
-| unique stock-days | 15,466,218 |
-| duplicate stock-days | 2,789 |
-| extra duplicate rows | 2,829 |
-| maximum rows per stock-day | 3 |
-
-A follow-up diagnostic showed that duplicate rows did not differ in the core trading fields:
-
-```text
-dlyprc, prc, dlyret, dlyretx, dlyreti, dlyvol, dlycap,
-OHLC variables, dlybid, dlyask
-```
-
-The differences were concentrated in distribution metadata, especially:
-
-```text
-distype
-disseqnbr
-```
-
-This suggests that duplicates are mostly caused by multiple distribution-event records attached to the same stock-date, rather than by conflicting price/return observations.
-
-For the universe-ready base table, we require one row per stock-date. Therefore, `prepare_universe_base.py` was updated to preserve exactly one row for each `(permno, dlycaldt)` pair and remove the extra duplicate rows. The full prepared table still keeps the raw distribution-event records for auditability.
-
-## 8. Daily stock universe construction
-
-The daily stock universe was created from:
-
-```text
-data/clean_parquet/daily_universe_ready_base/
-```
-
-using:
+Script:
 
 ```text
 src/create_daily_universe.py
 ```
 
-This script creates:
+Output:
 
 ```text
 data/clean_parquet/daily_stock_universe/
@@ -337,43 +235,52 @@ data/clean_parquet/daily_stock_universe_daily_summary.csv
 data/clean_parquet/daily_stock_universe_yearly_summary.csv
 ```
 
-The universe is constructed independently for each date. A stock is included in the daily universe if it satisfies the following conditions:
+The universe is constructed independently for each trading date. A stock is included if it satisfies the following conditions.
 
 | rule | reason |
 |---|---|
-| Start from `daily_universe_ready_base` | Remove structurally unusable stock-day rows before final universe construction. |
+| `tradingstatusflg = 'A'` | Keep stocks that are actively trading on date `t`. |
+| `securityactiveflg = 'Y'` | Exclude inactive security records. |
+| `dlydelflg = 'N'` | Exclude same-day terminal/delisting rows from new trading candidates. |
+| `prc > 0` and non-missing | Require a usable day-`t` price. |
+| `dlyvol > 0` and non-missing | Require a usable day-`t` volume field. |
+| `dlycap > 0` and non-missing | Require a usable day-`t` market capitalization. |
+| `dlyret` non-missing | Require current return availability for historical features and data integrity. |
 | `securitytype = 'EQTY'` | Keep equity securities. |
 | `securitysubtype = 'COM'` | Keep common-stock-like equities. |
-| `sharetype = 'NS'` | Keep normal share type used for the common-stock universe. |
+| `sharetype = 'NS'` | Keep normal shares. |
 | `usincflg = 'Y'` | Focus on U.S.-incorporated stocks. |
 | `shradrflg = 'N'` | Exclude ADRs. |
-| `primaryexch IN ('N', 'Q', 'A')` | Focus on major U.S. exchanges. |
-| `prc >= 5` | Exclude penny-stock-like names with severe microstructure noise and poor tradability. |
+| `primaryexch IN ('N', 'Q', 'A')` | Focus on NYSE, Nasdaq, and NYSE American style primary exchanges. |
+| `prc >= 5` | Remove penny-stock-like names with severe microstructure noise and poor tradability. |
 | `adv20 >= 1,000,000` | Require minimum 20-day average dollar volume. |
-| `market_cap_rank <= 3000` | Keep a broad but reasonably investable market-cap universe. |
-| `adv20_rank <= 4000` | Remove the most illiquid tail while allowing liquidity rank to be looser than market-cap rank. |
+| `market_cap_rank <= 3000` | Keep a broad but investable market-cap universe. |
+| `adv20_rank <= 4000` | Remove the least-liquid tail while allowing the liquidity rank to be looser than the market-cap rank. |
 | `hist_ret_obs_252 >= 126` | Require roughly half a year of historical return observations for stable feature construction. |
 
-Here,
+Important definitions:
 
 ```text
-adv20 = 20-day rolling average of dollar_volume
-dollar_volume = prc * dlyvol
-market_cap_rank = daily cross-sectional rank of dlycap, descending
-adv20_rank = daily cross-sectional rank of adv20, descending
+dollar_volume_for_universe = prc * dlyvol
+adv20 = 20-day rolling average of dollar_volume_for_universe
+market_cap_rank = daily descending rank of dlycap
+adv20_rank = daily descending rank of adv20
+hist_ret_obs_252 = number of non-missing returns in the trailing 252-row window
 ```
 
-The resulting universe contains 3,969,391 stock-day observations. This universe is intended to be the candidate set for later feature construction, prediction, and portfolio formation. It is not yet the final modeling table because labels and engineered features still need to be merged in.
+The resulting universe contains about 3.97 million stock-day observations. This table is the candidate set for prediction and portfolio formation, not yet the final model table.
 
-## 9. Universe-level missingness and abnormality checks
+## 3. Universe-level missingness checks
 
-After constructing `daily_stock_universe`, we scanned the universe table for missingness and abnormal values using:
+After constructing `daily_stock_universe`, we checked missingness and abnormality again.
+
+Script:
 
 ```text
 src/scan_universe_missing_abnormal.py
 ```
 
-This produced:
+Outputs:
 
 ```text
 data/clean_parquet/daily_stock_universe_missing_abnormal_report.csv
@@ -382,76 +289,443 @@ data/clean_parquet/daily_stock_universe_abnormal_examples.csv
 
 Important results:
 
-| variable | missing count | missing percentage | interpretation |
-|---|---:|---:|---|
-| `prc` | 0 | 0.0000% | Good: all universe rows have usable price. |
-| `dlyret` | 0 | 0.0000% | Good: all universe rows have current daily return. |
-| `dlyretx` | 0 | 0.0000% | Good: all universe rows have current price return. |
-| `dlyreti` | 0 | 0.0000% | Good: all universe rows have current income-return component. |
-| `dollar_volume` | 0 | 0.0000% | Good: all universe rows have usable dollar volume. |
-| `adv20` | 0 | 0.0000% | Good: all universe rows have valid rolling dollar-volume history. |
-| `market_cap_rank` | 0 | 0.0000% | Good: all universe rows have valid market-cap rank. |
-| `adv20_rank` | 0 | 0.0000% | Good: all universe rows have valid ADV rank. |
-| `dlyclose`, `dlyhigh`, `dlylow` | 850 | about 0.0214% | Mostly bid/ask-priced observations without trade-based OHLC. |
-| `dlyopen` | 854 | about 0.0215% | Same as above, plus four rows where open is missing but other OHLC fields exist. |
-| `dlybid`, `dlyask` | 4 | about 0.0001% | Rare quote-field missingness. |
-| `bid_ask_spread` | 608 | about 0.0153% | Mostly caused by crossed quotes or invalid bid/ask ordering. |
-| `price_ohlc_consistency` | 1 | about 0.00003% | One OHLC consistency violation. |
+| variable | missing count | interpretation |
+|---|---:|---|
+| `prc` | 0 | All universe rows have a usable price. |
+| `dlyret`, `dlyretx`, `dlyreti` | 0 | All universe rows have current return information. |
+| `dollar_volume_for_universe` | 0 | All universe rows have usable dollar volume. |
+| `adv20` | 0 | All universe rows pass the rolling liquidity requirement. |
+| `market_cap_rank`, `adv20_rank` | 0 | All universe rows have valid daily ranks. |
+| `dlyclose`, `dlyhigh`, `dlylow` | about 850 | Mostly bid/ask-priced observations without trade-based OHLC. |
+| `dlyopen` | about 854 | Same as above, plus a few rows where open is missing while high/low/close exist. |
+| `dlybid`, `dlyask` | 4 | Very rare quote-field missingness. |
+| `bid_ask_spread` | about 608 | Mostly caused by crossed quotes or invalid bid/ask ordering. |
+| OHLC consistency | 1 | One row violates normal OHLC ordering. |
 
-The universe is therefore usable for the next step. The remaining missingness is small and should be handled in feature engineering rather than by deleting stock-days from the universe.
+The universe is usable. Remaining missingness is small and should be handled in feature engineering rather than through row deletion.
 
-## 10. Universe edge-case diagnostics
+## 4. Universe edge-case diagnostics
 
-We then examined universe edge cases using:
+Script:
 
 ```text
 src/diagnose_universe_edge_case.py
 ```
 
-This produced targeted diagnostics for OHLC missingness, bid/ask missingness, bid-ask spread missingness, OHLC consistency, and return-missing flags.
-
 Main findings:
 
-- There are 850 OHLC-missing rows with `dlyprcflg = BA`, meaning that the daily price is based on bid/ask rather than a trade-based OHLC record.
-- There are four additional rows where `dlyopen` is missing but `dlyclose`, `dlyhigh`, and `dlylow` are present.
-- The 608 missing `bid_ask_spread` values consist of:
-
-```text
-604 rows with ask < bid
-4 rows with bid or ask missing
-```
-
-- There is one OHLC consistency violation:
+- The OHLC-missing rows mostly have `dlyprcflg = BA`, meaning the price is based on bid/ask rather than trade-based OHLC.
+- The 608 missing `bid_ask_spread` values are mostly due to `ask < bid`, not missing bid/ask fields.
+- There are four rows where `dlybid` or `dlyask` is missing while core price, volume, and return fields are valid.
+- There is one OHLC inconsistency:
 
 ```text
 2023-06-05, JOBY: open=5.72, high=6.09, low=5.76, close=5.99
 ```
 
-Here `open < low`. This row should be kept for return/backtest purposes, but OHLC-derived features should be set to missing or flagged for this stock-date.
+Here `open < low`. We keep the row for return and backtest purposes, but OHLC-derived features should be invalidated or set to missing for this row.
 
-- There are three non-missing `dlyretmissflg` rows with value `MV`, but `dlyret` itself is present. These should not be used as a universe filter.
+- High-price abnormal values are mostly valid high-priced stocks such as Berkshire Hathaway Class A. These should not be removed. Raw price is not used directly as a model feature; log and cross-sectional transformations are preferred.
 
-- High-price abnormal values are due to valid high-priced stocks such as Berkshire Hathaway Class A. These should not be removed. Raw price should not be used directly as a model feature; log or cross-sectional rank transformations are preferred.
+## 5. Universe decision summary
 
-## 11. Current conclusions and next step
-
-The cleaned universe is now ready for label and feature construction.
-
-Current decisions:
+Current universe decisions:
 
 - Keep OHLC-missing rows in the universe.
-- Keep the four bid/ask-missing rows in the universe.
-- Keep the one OHLC-inconsistent row in the universe, but invalidate OHLC-derived features for that row.
-- Keep high-price stocks such as Berkshire Hathaway Class A.
-- Do not use raw `prc` directly as an alpha feature; use log, rank, or normalized transformations.
-- Compute OHLC-derived features only when OHLC fields are complete and internally consistent.
+- Keep rare bid/ask-missing rows in the universe.
+- Keep the one OHLC-inconsistent row, but let feature engineering flag or invalidate OHLC-derived features.
+- Keep high-priced stocks such as Berkshire Hathaway Class A.
+- Do not use raw `prc` directly as a model feature.
+- Compute OHLC-derived features only when OHLC fields are complete and internally valid.
 - Compute bid-ask-spread features only when `dlybid > 0`, `dlyask > 0`, and `dlyask >= dlybid`.
-- Use missingness and validity indicators as candidate model features.
 
-The next planned step is response-variable construction. The recommended approach is to create labels from a broad return source such as `daily_core` or `daily_universe_prepare_all`, not from future universe membership. The main target should be a future compounded total return, such as:
+# Label and backtesting data creation
+
+The label and backtesting stage creates future-return outcomes from the broad return source. The key principle is that future realized returns should not be conditioned on future universe membership.
+
+Script:
+
+```text
+src/create_backtesting_data.py
+```
+
+Output:
+
+```text
+data/clean_parquet/backtesting_data/
+data/clean_parquet/backtesting_data_analysis/
+```
+
+## 1. Response variable choice
+
+The main modeling response is next 5-trading-day total return.
+
+For stock `i` on date `t`, the raw complete 5-day target is:
 
 ```text
 target_5d_raw(t) = product_{k=1}^5 (1 + dlyret(t+k)) - 1
 ```
 
-Then the label table can be merged onto `daily_stock_universe` by `(permno, dlycaldt)`. This avoids survivorship bias because future realized returns will not be conditioned on whether a stock remains in the future universe.
+We choose next 5-day return instead of next-day return for the first baseline because:
+
+- next-day returns are extremely noisy and lead to high-turnover signals,
+- a 5-day horizon is more stable for daily cross-sectional alpha research,
+- many economically meaningful daily features, such as momentum, reversal, volatility, and volume pressure, may play out over several days,
+- a 5-day horizon is still short enough to be useful for medium-frequency systematic trading.
+
+The model-panel target later becomes a cross-sectionally standardized version of this 5-day raw target.
+
+## 2. Return source and survivorship-bias control
+
+Labels are created from:
+
+```text
+data/clean_parquet/daily_core_dup_removed/
+```
+
+not from future `daily_stock_universe` membership.
+
+This matters because if a stock is in the universe on date `t`, then disappears from the universe later due to delisting, missing price, liquidity deterioration, suspension, or another adverse event, the backtest still needs to account for the realized outcome. Computing future returns only from future universe rows would introduce survivorship bias.
+
+## 3. Missing forward returns
+
+Before label creation, we screened missing `dlyret` in the de-duplicated core table. All missing returns had a documented `dlyretmissflg`.
+
+Observed missing-return flags included:
+
+| flag | interpretation | treatment |
+|---|---|---|
+| `NT` | Not tracked | Do not impute; not valid as an observed realized return. |
+| `NS` | New security | Do not impute; first return after listing may be unavailable. |
+| `MP` | Missing price | Do not impute; cannot compute reliable return. |
+| `RA` | Return after not-tracked period | Treat as unreliable for label construction. |
+| `DM` | Delisting price/amount missing | Delisting-related; handle with backtest stress rules. |
+| `DG` | Delisting price more than 10 periods from delisting date | Delisting-related; handle with backtest stress rules. |
+| `DP` | Delisting pending | Delisting-related; handle with backtest stress rules. |
+| `GP` | Gap between prices too large | Treat as unreliable for label construction. |
+
+For supervised training, we use only rows where all five future daily returns exist:
+
+```text
+target_5d_raw_complete_only
+```
+
+Rows with incomplete future returns are excluded from the training label, but they are not silently ignored in the backtesting return table.
+
+## 4. Backtesting return definitions
+
+`create_backtesting_data.py` creates multiple future-return columns:
+
+| column | purpose |
+|---|---|
+| `target_1d_raw` | One-day forward return for diagnostics or future robustness checks. |
+| `target_5d_raw_complete_only` | Complete 5-day compounded return; used as the supervised learning label. |
+| `bt_5d_return_zero_after_missing` | Main conservative backtest return: compound observed returns until the first missing return, then assume zero return for remaining days. |
+| `bt_5d_return_delist_stress_30` | Stress scenario: if the first missing return is delisting-related (`DM`, `DG`, `DP`), apply a -30% terminal return. |
+| `bt_5d_return_delist_stress_100` | Severe stress scenario: if the first missing return is delisting-related, apply a -100% terminal return. |
+| `target_has_missing_return` | Indicator for any missing return in the next 5 trading observations. |
+| `target_first_missing_return_flag` | First missing-return reason in the forward window. |
+| `target_missing_return_flag_set` | Set of missing-return flags appearing in the forward window. |
+| `target_has_delisting_missing_flag` | Indicator for delisting-related missing-return flags. |
+
+This design separates training labels from backtesting outcomes. Training uses complete labels, while backtesting can later evaluate robustness under multiple missing-return and delisting assumptions.
+
+# Feature engineering
+
+Feature engineering creates compact engineered features from the broad de-duplicated core table.
+
+Script:
+
+```text
+src/create_features.py
+```
+
+Output:
+
+```text
+data/clean_parquet/daily_features/
+```
+
+## 1. Feature source and timing
+
+Features are computed from:
+
+```text
+data/clean_parquet/daily_core_dup_removed/
+```
+
+This is important because rolling features require historical observations before a stock enters the final universe. For example, if a stock enters the universe on date `t`, its 60-day volatility or 120-day return should be computed using its own historical data before `t`, not only from dates where it was already in the final universe.
+
+All features use day-`t` or past information only. Future returns are not used in feature construction.
+
+## 2. Basic validity and event flags
+
+The feature table includes several binary indicators. These flags preserve data-quality and event information without dropping otherwise usable observations.
+
+| feature | reasoning |
+|---|---|
+| `active_non_delisting_flag` | Indicates whether the row is active, non-delisting, and therefore aligned with tradable-row logic. |
+| `price_from_bidask_flag` | Identifies rows where the price source is bid/ask based. This is useful because bid/ask-based prices may have different microstructure properties than trade-based prices. |
+| `ohlc_missing_flag` | Indicates missing OHLC fields. Missing OHLC should not force row deletion, but OHLC-derived features should be treated carefully. |
+| `valid_ohlc_flag` | Indicates OHLC fields are complete and internally consistent. |
+| `ohlc_inconsistent_flag` | Flags rows where open/high/low/close violate normal ordering. |
+| `bidask_missing_flag` | Flags missing bid or ask fields. |
+| `valid_bidask_flag` | Indicates bid and ask are positive and satisfy `ask >= bid`. |
+| `crossed_quote_flag` | Flags crossed quotes where `ask < bid`. These should invalidate spread-based features. |
+| `distribution_event_flag` | Indicates a dividend, split, or other distribution event is recorded. Such events may affect returns and short-term price dynamics. |
+| `cash_distribution_event_flag` | Flags cash-distribution event types. |
+| `split_distribution_event_flag` | Flags split-like distribution events. |
+| `ordinary_distribution_event_flag` | Flags ordinary distributions. |
+| `share_factor_event_flag` | Flags share-factor events. These are rare and may capture corporate-action or share-adjustment effects. |
+| `strong_up_high_volume_flag` | Event flag for a strong positive return day with high volume. |
+| `strong_down_high_volume_flag` | Event flag for a strong negative return day with high volume. |
+
+These flags are kept as raw 0/1 features in the model panel.
+
+## 3. Return-history features
+
+Return-history features capture short-term reversal and medium-term momentum.
+
+| feature | definition | intuition |
+|---|---|---|
+| `ret_1d` | Cumulative return through day `t` over 1 day. | Captures immediate reversal or continuation. |
+| `ret_2d` | Cumulative return over 2 days. | Captures very short-term price movement. |
+| `ret_5d` | Cumulative return over 5 days. | Weekly reversal/momentum signal. |
+| `ret_10d` | Cumulative return over 10 days. | Two-week momentum/reversal. |
+| `ret_20d` | Cumulative return over 20 days. | About one-month momentum. |
+| `ret_60d` | Cumulative return over 60 days. | Medium-term momentum. |
+| `ret_120d` | Cumulative return over 120 days. | Longer medium-term momentum, within the maximum rolling window. |
+| `ret_20_5` | Cumulative return from `t-20` to `t-5`. | Momentum signal skipping the most recent days to reduce short-term reversal contamination. |
+
+The maximum rolling window for feature creation is 120 days. We do not include `ret_252d` in the active feature set.
+
+Cumulative returns are computed using compounded daily returns:
+
+```text
+prod(1 + dlyret) - 1
+```
+
+If a required return in the window is missing, the rolling feature is set to missing. If a return in the window is less than or equal to -100%, the cumulative return is set to -1.
+
+## 4. Volatility and downside-risk features
+
+Risk features capture instability, lottery-like behavior, and downside risk.
+
+For windows 5, 10, 20, and 60 days, the script creates:
+
+| feature family | definition | intuition |
+|---|---|---|
+| `vol_*d` | Rolling standard deviation of daily returns. | Higher volatility may predict reversals, risk premia, or lower future risk-adjusted returns. |
+| `skew_*d` | Rolling skewness of daily returns. | Captures lottery preference and asymmetric return behavior. |
+| `max_ret_*d` | Maximum daily return in the window. | Captures jump-like upside behavior and potential lottery demand. |
+| `min_ret_*d` | Minimum daily return in the window. | Captures recent crash or downside shock. |
+| `downside_vol_*d` | Square root of average squared negative returns, with nonnegative returns contributing zero. | Focuses on downside risk rather than total volatility. |
+| `hl_range_avg_*d` | Rolling average of daily high-low range. | Intraday range is a volatility proxy when OHLC is available. |
+
+These features are computed only when the required number of observations is available. OHLC range features are missing when high/low fields are missing or invalid.
+
+## 5. Liquidity and volume features
+
+Liquidity and volume variables are central to daily alpha research because they capture tradability, investor attention, crowding, and trading pressure.
+
+| feature | definition | intuition |
+|---|---|---|
+| `dollar_volume` | `prc * dlyvol`. | Daily dollar trading activity. |
+| `log_dollar_volume` | `log(prc * dlyvol)`. | Log-scaled liquidity measure, less dominated by mega-cap stocks. |
+| `log_prc` | `log(prc)`. | Price-level information after reducing scale effects. |
+| `log_dlycap` | `log(dlycap)`. | Size proxy. |
+| `bid_ask_spread` | `(ask - bid) / midpoint`, only if bid/ask are valid. | Trading-cost and liquidity proxy. |
+| `hl_range` | `high / low - 1`, only if high/low are valid. | Intraday volatility and range proxy. |
+| `open_close_ret` | `close / open - 1`, only if open/close are valid. | Intraday return pressure. |
+| `turnover` | `dlyvol / (shrout * 1000)`. | Volume scaled by shares outstanding; proxy for trading intensity. |
+| `amihud_illiq` | `abs(dlyret) / dollar_volume`. | Price impact / illiquidity proxy. |
+| `adv5`, `adv20`, `adv60` | Rolling average dollar volume over 5/20/60 days. | Short- and medium-term liquidity. |
+| `avg_volume_5d`, `avg_volume_20d`, `avg_volume_60d` | Rolling average share volume. | Baseline trading volume. |
+| `volume_shock` | `dlyvol / avg_volume_20d`. | Abnormal share-volume activity. |
+| `dollar_volume_shock` | `dollar_volume / adv20`. | Abnormal dollar-volume activity. |
+| `turnover_avg_5d`, `turnover_avg_20d`, `turnover_avg_60d` | Rolling average turnover. | Persistent trading intensity. |
+| `amihud_illiq_avg_5d`, `amihud_illiq_avg_20d`, `amihud_illiq_avg_60d` | Rolling average Amihud illiquidity. | Persistent price impact / illiquidity. |
+
+The universe already enforces minimum liquidity, but these features still matter because relative liquidity, volume shocks, and turnover dynamics can predict future cross-sectional returns.
+
+## 6. Price-pressure features
+
+Price-pressure features combine return direction with abnormal trading activity.
+
+| feature | definition | intuition |
+|---|---|---|
+| `ret_1d_x_volume_shock` | `ret_1d * volume_shock`. | A recent return is more informative when accompanied by abnormal volume. |
+| `ret_5d_x_volume_shock` | `ret_5d * volume_shock`. | Weekly momentum or reversal conditional on abnormal volume. |
+| `signed_abnormal_volume` | Positive abnormal volume on positive-return days, negative abnormal volume on negative-return days. | Captures directionally signed volume pressure. |
+| `signed_abnormal_volume_ratio` | Signed version of `volume_shock - 1`. | Scale-free abnormal-volume pressure. |
+| `signed_dollar_volume_shock` | Signed version of `dollar_volume_shock - 1`. | Directional dollar-volume pressure. |
+| `strong_up_high_volume_flag` | `ret_1d >= 2%` and `volume_shock >= 2`. | Event indicator for strong up move with high volume. |
+| `strong_down_high_volume_flag` | `ret_1d <= -2%` and `volume_shock >= 2`. | Event indicator for strong down move with high volume. |
+| `up_high_volume_pressure` | `ret_1d * (volume_shock - 1)` on positive-return, high-volume days. | Continuous pressure measure for strong buying pressure. |
+| `down_high_volume_pressure` | `ret_1d * (volume_shock - 1)` on negative-return, high-volume days. | Continuous pressure measure for strong selling pressure. |
+
+The high-volume pressure variables are event-style variables. Missing values often mean the event did not occur, not that the raw data is unavailable. In the first model panel, their transformed values are filled with zero after cross-sectional transformation.
+
+## 7. Optional features excluded from the first baseline
+
+`create_features.py` creates `log_num_trades` and `log_market_maker_count`, but the first model panel excludes their transformed versions because they have high structural missingness. These features may be tested later in an ablation study.
+
+# Model panel construction
+
+The model panel combines the universe, the training label, and engineered features into a compact table ready for LightGBM.
+
+Script:
+
+```text
+src/create_model_panel.py
+```
+
+Output:
+
+```text
+data/clean_parquet/model_panel/
+data/clean_parquet/model_panel_analysis/model_panel_feature_columns.csv
+data/clean_parquet/model_panel_analysis/model_panel_target_column.csv
+```
+
+## 1. Model-panel joins
+
+The model panel is rooted in:
+
+```text
+data/clean_parquet/daily_stock_universe/
+```
+
+Then it joins:
+
+```text
+data/clean_parquet/backtesting_data/
+```
+
+to obtain only:
+
+```text
+target_5d_raw_complete_only
+```
+
+Then it joins:
+
+```text
+data/clean_parquet/daily_features/
+```
+
+to obtain engineered features.
+
+The join keys are:
+
+```text
+permno, dlycaldt
+```
+
+## 2. Label filtering
+
+After joining, the model panel keeps only rows with complete 5-day future return labels:
+
+```text
+target_5d_raw_complete_only IS NOT NULL
+```
+
+This automatically removes:
+
+- the final observations for each stock that do not have enough future returns,
+- rows where any of the next five daily returns is missing,
+- rows that cannot be used for clean supervised training.
+
+Backtesting should not use this complete-label-only model panel directly. Backtesting should use `backtesting_data`, which contains missing-return and delisting stress scenarios.
+
+## 3. Cross-sectional normalization
+
+For the response, the model panel applies date-wise robust normalization:
+
+1. winsorize `target_5d_raw_complete_only` at the daily 1st and 99th percentiles,
+2. center by the daily median,
+3. scale by daily interquartile range divided by 1.349.
+
+The final response is:
+
+```text
+target_5d_cs_zscore
+```
+
+For continuous features, the model panel applies the same daily robust transformation:
+
+1. compute daily `p01`, `p25`, `p50`, `p75`, and `p99`,
+2. winsorize each feature at `p01`/`p99`,
+3. standardize by `(p75 - p25) / 1.349`,
+4. output only the transformed feature:
+
+```text
+<feature>_cs_winsor_zscore
+```
+
+This cross-sectional transformation is done after joining to the stock universe, so each day’s normalization is computed on the actual tradable model universe rather than on the full raw CRSP panel.
+
+Binary and event flags are kept as raw 0/1 features.
+
+For the first baseline:
+
+- `up_high_volume_pressure_cs_winsor_zscore` and `down_high_volume_pressure_cs_winsor_zscore` are filled with 0 when missing, because missing means the pressure event did not occur.
+- `log_num_trades` and `log_market_maker_count` features are excluded because they have high structural missingness.
+- The model panel is processed year by year to avoid memory problems in WSL.
+
+## 4. Final model-panel columns
+
+The final model panel keeps only necessary columns:
+
+```text
+permno
+dlycaldt
+year
+ticker
+primaryexch
+siccd
+naics
+icbindustry
+target_5d_cs_zscore
+model features
+```
+
+There is only one response column:
+
+```text
+target_5d_cs_zscore
+```
+
+The feature list is saved to:
+
+```text
+data/clean_parquet/model_panel_analysis/model_panel_feature_columns.csv
+```
+
+The target metadata is saved to:
+
+```text
+data/clean_parquet/model_panel_analysis/model_panel_target_column.csv
+```
+
+# Planned first LightGBM experiment
+
+The next planned step is to train a baseline LightGBM model.
+
+Recommended split:
+
+| split | years | purpose |
+|---|---|---|
+| training | 2019--2022 | Fit model parameters. |
+| validation | 2023 | Tune hyperparameters and inspect IC. |
+| out-of-sample test / backtest | 2024--2025 | Final performance evaluation after model choices are fixed. |
+
+Because the response is a 5-day forward return, the last 5 trading dates near split boundaries should be removed from the training or validation split when necessary to avoid label-window leakage across periods.
+
+The first evaluation should focus on:
+
+- validation daily Rank IC,
+- mean IC,
+- ICIR,
+- feature importance,
+- later 2024--2025 portfolio backtest using `backtesting_data` return scenarios.

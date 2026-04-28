@@ -8,6 +8,7 @@ ROOT = Path("/home/xul9527/us-stock")
 
 UNIVERSE_GLOB = ROOT / "data/clean_parquet/daily_stock_universe/**/*.parquet"
 BACKTEST_GLOB = ROOT / "data/clean_parquet/backtesting_data/**/*.parquet"
+FEATURE_GLOB = ROOT / "data/clean_parquet/daily_features/**/*.parquet"
 
 OUT_PANEL = ROOT / "data/clean_parquet/model_panel"
 OUT_ANALYSIS = ROOT / "data/clean_parquet/model_panel_analysis"
@@ -15,289 +16,430 @@ OUT_ANALYSIS = ROOT / "data/clean_parquet/model_panel_analysis"
 if OUT_PANEL.exists():
     shutil.rmtree(OUT_PANEL)
 
-OUT_PANEL.parent.mkdir(parents=True, exist_ok=True)
+OUT_PANEL.mkdir(parents=True, exist_ok=True)
 OUT_ANALYSIS.mkdir(parents=True, exist_ok=True)
 
 TMP_DIR = ROOT / "data/duckdb_tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 con = duckdb.connect(str(ROOT / "data/us_stock.duckdb"))
-con.execute("PRAGMA threads=2")
-con.execute("SET memory_limit='4GB'")
+con.execute("PRAGMA threads=1")
+con.execute("SET memory_limit='3GB'")
 con.execute("SET preserve_insertion_order=false")
 con.execute(f"SET temp_directory='{TMP_DIR}'")
+con.execute("SET max_temp_directory_size='150GB'")
 
 
-# ---------------------------------------------------------------------
-# Step 1. Merge daily universe with return labels.
-#
-# Universe source:
-#   data/clean_parquet/daily_stock_universe
-#
-# Label source:
-#   data/clean_parquet/backtesting_data
-#
-# We merge by (permno, dlycaldt). The label was created from the broader
-# daily_core_dup_removed data, not from future universe membership.
-# ---------------------------------------------------------------------
+# ============================================================
+# Columns
+# ============================================================
 
-print("\nCreating model panel...")
+ID_COLS_IN_FILE = [
+    "permno",
+    "dlycaldt",
+    "ticker",
+    "primaryexch",
+    "siccd",
+    "naics",
+    "icbindustry",
+]
 
-con.execute(f"""
-CREATE OR REPLACE TEMP VIEW joined_panel AS
-SELECT
-    u.*,
+BINARY_FEATURES = [
+    "active_non_delisting_flag",
+    "price_from_bidask_flag",
+    "ohlc_missing_flag",
+    "valid_ohlc_flag",
+    "ohlc_inconsistent_flag",
+    "bidask_missing_flag",
+    "valid_bidask_flag",
+    "crossed_quote_flag",
+    "distribution_event_flag",
+    "cash_distribution_event_flag",
+    "split_distribution_event_flag",
+    "ordinary_distribution_event_flag",
+    "share_factor_event_flag",
+    "strong_up_high_volume_flag",
+    "strong_down_high_volume_flag",
+]
 
-    l.target_1d_raw,
-    l.target_5d_raw_complete_only,
+CONTINUOUS_FEATURES = [
+    # Universe-rank variables
+    "market_cap_rank",
+    "adv20_rank",
 
-    l.bt_5d_return_zero_after_missing,
-    l.bt_5d_return_delist_stress_30,
-    l.bt_5d_return_delist_stress_100,
+    # Basic engineered features
+    "log_prc",
+    "log_dlycap",
+    "dollar_volume",
+    "log_dollar_volume",
 
-    l.target_has_missing_return,
-    l.target_first_missing_return_pos,
-    l.target_first_missing_return_flag,
-    l.target_missing_return_flag_set,
-    l.target_has_delisting_missing_flag,
-    l.target_n_valid_forward_returns,
+    # Excluded for first baseline due to high structural missingness:
+    # "log_num_trades",
+    # "log_market_maker_count",
 
-    l.fwd_date_1,
-    l.fwd_date_2,
-    l.fwd_date_3,
-    l.fwd_date_4,
-    l.fwd_date_5,
+    "bid_ask_spread",
+    "hl_range",
+    "open_close_ret",
+    "turnover",
+    "amihud_illiq",
 
-    l.ret_1,
-    l.ret_2,
-    l.ret_3,
-    l.ret_4,
-    l.ret_5
+    # Return history
+    "ret_1d",
+    "ret_2d",
+    "ret_5d",
+    "ret_10d",
+    "ret_20d",
+    "ret_60d",
+    "ret_120d",
+    "ret_20_5",
 
-FROM read_parquet('{UNIVERSE_GLOB}', hive_partitioning=true) u
-LEFT JOIN read_parquet('{BACKTEST_GLOB}', hive_partitioning=true) l
-  ON u.permno = l.permno
- AND u.dlycaldt = l.dlycaldt
-;
-""")
+    # Volatility and downside risk
+    "vol_5d",
+    "vol_10d",
+    "vol_20d",
+    "vol_60d",
+    "skew_5d",
+    "skew_10d",
+    "skew_20d",
+    "skew_60d",
+    "max_ret_5d",
+    "max_ret_10d",
+    "max_ret_20d",
+    "max_ret_60d",
+    "min_ret_5d",
+    "min_ret_10d",
+    "min_ret_20d",
+    "min_ret_60d",
+    "downside_vol_5d",
+    "downside_vol_10d",
+    "downside_vol_20d",
+    "downside_vol_60d",
+    "hl_range_avg_5d",
+    "hl_range_avg_10d",
+    "hl_range_avg_20d",
+    "hl_range_avg_60d",
+
+    # Liquidity and volume
+    "adv5",
+    "adv20",
+    "adv60",
+    "avg_volume_5d",
+    "avg_volume_20d",
+    "avg_volume_60d",
+    "volume_shock",
+    "dollar_volume_shock",
+    "turnover_avg_5d",
+    "turnover_avg_20d",
+    "turnover_avg_60d",
+    "amihud_illiq_avg_5d",
+    "amihud_illiq_avg_20d",
+    "amihud_illiq_avg_60d",
+
+    # Price pressure
+    "ret_1d_x_volume_shock",
+    "ret_5d_x_volume_shock",
+    "signed_abnormal_volume",
+    "signed_abnormal_volume_ratio",
+    "signed_dollar_volume_shock",
+    "up_high_volume_pressure",
+    "down_high_volume_pressure",
+]
+
+# These pressure features are event-style features.
+# Missing means the pressure event did not occur, so final transformed
+# values are filled with 0 in the model panel.
+ZERO_FILL_TRANSFORMED_FEATURES = {
+    "up_high_volume_pressure_cs_winsor_zscore",
+    "down_high_volume_pressure_cs_winsor_zscore",
+}
 
 
-# ---------------------------------------------------------------------
-# Step 2. Keep only rows with complete 5-day future return label.
-#
-# This automatically removes:
-#   - final 5 observations for each stock without enough future returns;
-#   - rows whose future 5-day window contains missing dlyret;
-#   - rows that cannot be used for clean supervised training.
-#
-# For backtesting later, do NOT use only this complete-label table.
-# Use backtesting_data and the backtest-specific return columns.
-# ---------------------------------------------------------------------
+# ============================================================
+# SQL helpers
+# ============================================================
 
-con.execute("""
-CREATE OR REPLACE TEMP VIEW model_panel_complete AS
-SELECT *
-FROM joined_panel
-WHERE target_5d_raw_complete_only IS NOT NULL
-;
-""")
+FINITE_BOUND = "1e100"
 
+id_sql = ",\n        ".join(ID_COLS_IN_FILE)
 
-# ---------------------------------------------------------------------
-# Step 3. Add cross-sectional target transformations.
-#
-# target_5d_raw_complete_only:
-#   raw compounded future 5-day total return; useful for IC/backtest checks.
-#
-# target_5d_winsor:
-#   date-wise 1%/99% winsorized return.
-#
-# target_5d_cs_zscore:
-#   date-wise z-scored winsorized return; useful as LGBM regression target.
-# ---------------------------------------------------------------------
-
-con.execute("""
-CREATE OR REPLACE TEMP VIEW model_panel_final AS
-WITH date_quantiles AS (
-    SELECT
-        dlycaldt,
-        APPROX_QUANTILE(target_5d_raw_complete_only, 0.01) AS target_5d_p01,
-        APPROX_QUANTILE(target_5d_raw_complete_only, 0.99) AS target_5d_p99
-    FROM model_panel_complete
-    GROUP BY dlycaldt
-),
-
-winsorized AS (
-    SELECT
-        m.*,
-        q.target_5d_p01,
-        q.target_5d_p99,
-
-        CASE
-            WHEN m.target_5d_raw_complete_only < q.target_5d_p01 THEN q.target_5d_p01
-            WHEN m.target_5d_raw_complete_only > q.target_5d_p99 THEN q.target_5d_p99
-            ELSE m.target_5d_raw_complete_only
-        END AS target_5d_winsor
-
-    FROM model_panel_complete m
-    LEFT JOIN date_quantiles q
-      ON m.dlycaldt = q.dlycaldt
-),
-
-date_stats AS (
-    SELECT
-        dlycaldt,
-        AVG(target_5d_winsor) AS target_5d_winsor_mean,
-        STDDEV_SAMP(target_5d_winsor) AS target_5d_winsor_sd,
-        COUNT(*) AS n_cross_section
-    FROM winsorized
-    GROUP BY dlycaldt
-),
-
-with_zscore AS (
-    SELECT
-        w.*,
-        s.target_5d_winsor_mean,
-        s.target_5d_winsor_sd,
-        s.n_cross_section,
-
-        CASE
-            WHEN s.target_5d_winsor_sd IS NULL OR s.target_5d_winsor_sd = 0 THEN 0.0
-            ELSE (w.target_5d_winsor - s.target_5d_winsor_mean) / s.target_5d_winsor_sd
-        END AS target_5d_cs_zscore
-
-    FROM winsorized w
-    LEFT JOIN date_stats s
-      ON w.dlycaldt = s.dlycaldt
+binary_select_sql = ",\n            ".join(
+    f"COALESCE(CAST(f.{col} AS INTEGER), 0) AS {col}"
+    for col in BINARY_FEATURES
 )
 
-SELECT *
-FROM with_zscore
-;
-""")
+continuous_select_parts = [
+    "CAST(u.market_cap_rank AS DOUBLE) AS market_cap_rank",
+    "CAST(u.adv20_rank AS DOUBLE) AS adv20_rank",
+]
+
+for col in CONTINUOUS_FEATURES:
+    if col not in {"market_cap_rank", "adv20_rank"}:
+        continuous_select_parts.append(f"TRY_CAST(f.{col} AS DOUBLE) AS {col}")
+
+continuous_select_sql = ",\n            ".join(continuous_select_parts)
+
+clean_continuous_exprs = []
+for col in CONTINUOUS_FEATURES:
+    clean_continuous_exprs.append(f"""
+        CASE
+            WHEN {col} IS NOT NULL
+             AND {col} BETWEEN -{FINITE_BOUND} AND {FINITE_BOUND}
+            THEN {col}
+            ELSE NULL
+        END AS {col}
+    """)
+
+clean_continuous_sql = ",\n            ".join(clean_continuous_exprs)
+
+feature_quantile_exprs = []
+for col in CONTINUOUS_FEATURES:
+    feature_quantile_exprs.extend([
+        f"APPROX_QUANTILE({col}, 0.01) AS {col}_p01",
+        f"APPROX_QUANTILE({col}, 0.25) AS {col}_p25",
+        f"APPROX_QUANTILE({col}, 0.50) AS {col}_p50",
+        f"APPROX_QUANTILE({col}, 0.75) AS {col}_p75",
+        f"APPROX_QUANTILE({col}, 0.99) AS {col}_p99",
+    ])
+
+feature_quantile_sql = ",\n            ".join(feature_quantile_exprs)
+
+feature_transform_exprs = []
+
+for col in CONTINUOUS_FEATURES:
+    clipped_expr = f"""
+        CASE
+            WHEN p.{col} IS NULL THEN NULL
+            WHEN p.{col} < q.{col}_p01 THEN q.{col}_p01
+            WHEN p.{col} > q.{col}_p99 THEN q.{col}_p99
+            ELSE p.{col}
+        END
+    """
+
+    robust_scale_expr = f"""
+        NULLIF((q.{col}_p75 - q.{col}_p25) / 1.349, 0)
+    """
+
+    feature_transform_exprs.append(f"""
+        CASE
+            WHEN p.{col} IS NOT NULL
+             AND q.{col}_p25 IS NOT NULL
+             AND q.{col}_p75 IS NOT NULL
+             AND q.{col}_p75 > q.{col}_p25
+            THEN ({clipped_expr} - q.{col}_p50) / {robust_scale_expr}
+            ELSE NULL
+        END AS {col}_cs_winsor_zscore
+    """)
+
+feature_transform_sql = ",\n            ".join(feature_transform_exprs)
+
+final_feature_cols = []
+final_feature_cols.extend(BINARY_FEATURES)
+
+for col in CONTINUOUS_FEATURES:
+    final_feature_cols.append(f"{col}_cs_winsor_zscore")
+
+final_feature_select_exprs = []
+
+for col in final_feature_cols:
+    if col in ZERO_FILL_TRANSFORMED_FEATURES:
+        final_feature_select_exprs.append(f"COALESCE({col}, 0.0) AS {col}")
+    else:
+        final_feature_select_exprs.append(col)
+
+final_feature_sql = ",\n        ".join(final_feature_select_exprs)
 
 
-# ---------------------------------------------------------------------
-# Step 4. Save model panel.
-# ---------------------------------------------------------------------
+# ============================================================
+# Year-by-year processing
+# ============================================================
 
-con.execute(f"""
-COPY (
-    SELECT *
-    FROM model_panel_final
-)
-TO '{OUT_PANEL}'
-(FORMAT PARQUET, PARTITION_BY (year), COMPRESSION ZSTD);
-""")
+years = [
+    row[0]
+    for row in con.execute(f"""
+        SELECT DISTINCT year
+        FROM read_parquet('{UNIVERSE_GLOB}', hive_partitioning=true)
+        ORDER BY year
+    """).fetchall()
+]
 
-print(f"Saved model panel to: {OUT_PANEL}")
+print(f"\nCreating compact model panel year by year: {years}")
+
+for year in years:
+    print(f"\nProcessing year {year}...")
+
+    year_dir = OUT_PANEL / f"year={year}"
+    year_dir.mkdir(parents=True, exist_ok=True)
+    out_file = year_dir / "part.parquet"
+
+    if out_file.exists():
+        out_file.unlink()
+
+    con.execute(f"""
+    COPY (
+        WITH joined_panel AS (
+            SELECT
+                u.permno,
+                u.dlycaldt,
+                u.ticker,
+                u.primaryexch,
+                u.siccd,
+                u.naics,
+                u.icbindustry,
+
+                TRY_CAST(l.target_5d_raw_complete_only AS DOUBLE)
+                    AS target_5d_raw_complete_only,
+
+                {binary_select_sql},
+
+                {continuous_select_sql}
+
+            FROM (
+                SELECT *
+                FROM read_parquet('{UNIVERSE_GLOB}', hive_partitioning=true)
+                WHERE year = {year}
+            ) u
+
+            LEFT JOIN (
+                SELECT
+                    permno,
+                    dlycaldt,
+                    target_5d_raw_complete_only
+                FROM read_parquet('{BACKTEST_GLOB}', hive_partitioning=true)
+                WHERE year = {year}
+            ) l
+              ON u.permno = l.permno
+             AND u.dlycaldt = l.dlycaldt
+
+            LEFT JOIN (
+                SELECT
+                    permno,
+                    dlycaldt,
+                    {", ".join(BINARY_FEATURES)},
+                    {", ".join([c for c in CONTINUOUS_FEATURES if c not in {"market_cap_rank", "adv20_rank"}])}
+                FROM read_parquet('{FEATURE_GLOB}', hive_partitioning=true)
+                WHERE year = {year}
+            ) f
+              ON u.permno = f.permno
+             AND u.dlycaldt = f.dlycaldt
+        ),
+
+        complete_label_panel AS (
+            SELECT *
+            FROM joined_panel
+            WHERE target_5d_raw_complete_only IS NOT NULL
+              AND target_5d_raw_complete_only BETWEEN -{FINITE_BOUND} AND {FINITE_BOUND}
+        ),
+
+        clean_panel AS (
+            SELECT
+                {id_sql},
+
+                target_5d_raw_complete_only,
+
+                {", ".join(BINARY_FEATURES)},
+
+                {clean_continuous_sql}
+
+            FROM complete_label_panel
+        ),
+
+        target_quantiles AS (
+            SELECT
+                dlycaldt,
+                APPROX_QUANTILE(target_5d_raw_complete_only, 0.01) AS target_5d_p01,
+                APPROX_QUANTILE(target_5d_raw_complete_only, 0.25) AS target_5d_p25,
+                APPROX_QUANTILE(target_5d_raw_complete_only, 0.50) AS target_5d_p50,
+                APPROX_QUANTILE(target_5d_raw_complete_only, 0.75) AS target_5d_p75,
+                APPROX_QUANTILE(target_5d_raw_complete_only, 0.99) AS target_5d_p99
+            FROM clean_panel
+            GROUP BY dlycaldt
+        ),
+
+        with_response AS (
+            SELECT
+                p.*,
+
+                CASE
+                    WHEN q.target_5d_p25 IS NOT NULL
+                     AND q.target_5d_p75 IS NOT NULL
+                     AND q.target_5d_p75 > q.target_5d_p25
+                    THEN
+                        (
+                            CASE
+                                WHEN p.target_5d_raw_complete_only < q.target_5d_p01
+                                    THEN q.target_5d_p01
+                                WHEN p.target_5d_raw_complete_only > q.target_5d_p99
+                                    THEN q.target_5d_p99
+                                ELSE p.target_5d_raw_complete_only
+                            END
+                            - q.target_5d_p50
+                        )
+                        / NULLIF((q.target_5d_p75 - q.target_5d_p25) / 1.349, 0)
+                    ELSE 0.0
+                END AS target_5d_cs_zscore
+
+            FROM clean_panel p
+            LEFT JOIN target_quantiles q
+              ON p.dlycaldt = q.dlycaldt
+        ),
+
+        feature_quantiles AS (
+            SELECT
+                dlycaldt,
+                {feature_quantile_sql}
+            FROM with_response
+            GROUP BY dlycaldt
+        ),
+
+        transformed AS (
+            SELECT
+                p.*,
+
+                {feature_transform_sql}
+
+            FROM with_response p
+            LEFT JOIN feature_quantiles q
+              ON p.dlycaldt = q.dlycaldt
+        )
+
+        SELECT
+            {id_sql},
+
+            target_5d_cs_zscore,
+
+            {final_feature_sql}
+
+        FROM transformed
+    )
+    TO '{out_file}'
+    (FORMAT PARQUET, COMPRESSION SNAPPY);
+    """)
+
+    print(f"Saved year {year} to: {out_file}")
 
 
-# ---------------------------------------------------------------------
-# Step 5. Diagnostics.
-# ---------------------------------------------------------------------
+# ============================================================
+# Metadata
+# ============================================================
 
-PANEL_GLOB = OUT_PANEL / "**/*.parquet"
+feature_metadata = pd.DataFrame({
+    "feature": final_feature_cols,
+    "role": ["feature"] * len(final_feature_cols),
+})
 
-summary = con.execute("""
-    SELECT
-        (SELECT COUNT(*) FROM joined_panel) AS n_universe_rows,
-        (SELECT COUNT(*) FROM model_panel_complete) AS n_complete_label_rows,
-        (SELECT COUNT(*) FROM joined_panel WHERE target_5d_raw_complete_only IS NULL)
-            AS n_rows_dropped_missing_complete_5d_label,
-        (SELECT AVG(CASE WHEN target_5d_raw_complete_only IS NULL THEN 1.0 ELSE 0.0 END)
-         FROM joined_panel) AS missing_complete_5d_label_rate
-""").df()
+feature_metadata_path = OUT_ANALYSIS / "model_panel_feature_columns.csv"
+feature_metadata.to_csv(feature_metadata_path, index=False)
 
-summary_path = OUT_ANALYSIS / "model_panel_summary.csv"
-summary.to_csv(summary_path, index=False)
+target_metadata = pd.DataFrame({
+    "target": ["target_5d_cs_zscore"],
+    "description": [
+        "Date-wise p01/p99 winsorized and median-IQR standardized forward 5-trading-day total return."
+    ],
+})
 
-print("\nModel panel summary:")
-print(summary.to_string(index=False))
-print(f"Saved to: {summary_path}")
+target_metadata_path = OUT_ANALYSIS / "model_panel_target_column.csv"
+target_metadata.to_csv(target_metadata_path, index=False)
 
-
-daily_summary = con.execute(f"""
-    SELECT
-        dlycaldt,
-        year,
-        COUNT(*) AS n_model_rows,
-        APPROX_QUANTILE(target_5d_raw_complete_only, 0.01) AS target_5d_p01,
-        APPROX_QUANTILE(target_5d_raw_complete_only, 0.50) AS target_5d_p50,
-        APPROX_QUANTILE(target_5d_raw_complete_only, 0.99) AS target_5d_p99,
-        AVG(target_5d_raw_complete_only) AS mean_target_5d_raw,
-        AVG(target_5d_cs_zscore) AS mean_target_5d_cs_zscore,
-        STDDEV_SAMP(target_5d_cs_zscore) AS sd_target_5d_cs_zscore
-    FROM read_parquet('{PANEL_GLOB}', hive_partitioning=true)
-    GROUP BY dlycaldt, year
-    ORDER BY dlycaldt
-""").df()
-
-daily_summary_path = OUT_ANALYSIS / "model_panel_daily_summary.csv"
-daily_summary.to_csv(daily_summary_path, index=False)
-
-print(f"Saved daily summary to: {daily_summary_path}")
-
-
-yearly_summary = con.execute(f"""
-    SELECT
-        year,
-        COUNT(*) AS n_rows,
-        COUNT(DISTINCT dlycaldt) AS n_days,
-        COUNT(DISTINCT permno) AS n_unique_permnos,
-        AVG(target_5d_raw_complete_only) AS mean_target_5d_raw,
-        APPROX_QUANTILE(target_5d_raw_complete_only, 0.50) AS median_target_5d_raw,
-        AVG(target_5d_cs_zscore) AS mean_target_5d_cs_zscore,
-        STDDEV_SAMP(target_5d_cs_zscore) AS sd_target_5d_cs_zscore
-    FROM read_parquet('{PANEL_GLOB}', hive_partitioning=true)
-    GROUP BY year
-    ORDER BY year
-""").df()
-
-yearly_summary_path = OUT_ANALYSIS / "model_panel_yearly_summary.csv"
-yearly_summary.to_csv(yearly_summary_path, index=False)
-
-print("\nYearly summary:")
-print(yearly_summary.to_string(index=False))
-print(f"Saved to: {yearly_summary_path}")
-
-
-# Rows dropped because complete 5-day target is missing.
-# We save only examples, not all dropped rows.
-dropped_examples = con.execute("""
-    SELECT *
-    FROM joined_panel
-    WHERE target_5d_raw_complete_only IS NULL
-    ORDER BY dlycaldt DESC, permno
-    LIMIT 500
-""").df()
-
-dropped_examples_path = OUT_ANALYSIS / "model_panel_dropped_missing_target_examples.csv"
-dropped_examples.to_csv(dropped_examples_path, index=False)
-
-print(f"\nSaved dropped-label examples to: {dropped_examples_path}")
-
-
-recent_dates = con.execute("""
-    SELECT
-        dlycaldt,
-        COUNT(*) AS n_universe_rows,
-        SUM(CASE WHEN target_5d_raw_complete_only IS NULL THEN 1 ELSE 0 END)
-            AS n_missing_complete_5d_label,
-        AVG(CASE WHEN target_5d_raw_complete_only IS NULL THEN 1.0 ELSE 0.0 END)
-            AS missing_complete_5d_label_rate
-    FROM joined_panel
-    GROUP BY dlycaldt
-    ORDER BY dlycaldt DESC
-    LIMIT 15
-""").df()
-
-recent_dates_path = OUT_ANALYSIS / "recent_dates_label_availability.csv"
-recent_dates.to_csv(recent_dates_path, index=False)
-
-print("\nRecent dates label availability:")
-print(recent_dates.to_string(index=False))
-print(f"Saved to: {recent_dates_path}")
-
-
-print("\nFinished creating model panel.")
+print(f"\nSaved feature metadata to: {feature_metadata_path}")
+print(f"Saved target metadata to: {target_metadata_path}")
+print("\nFinished creating compact model panel.")
