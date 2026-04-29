@@ -6,3 +6,4 @@ matplotlib
 tqdm
 pyarrow
 duckdb
+lightgbm

@@ -147,6 +147,12 @@ venv.bak/
 data/*
 data/data_parquet/*
 
+# model output
+model_outputs/*
+
+# backtest result
+backtest_result/*
+
 # Spyder project settings
 .spyderproject
 .spyproject

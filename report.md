@@ -1,12 +1,16 @@
-# U.S. Stock Daily Data Processing and Modeling Pipeline Report
+# Daily U.S. Equity Alpha Research: Data Engineering, Cross-Sectional Return Prediction, and Backtesting
 
-This report summarizes the data-processing and modeling-data construction pipeline for the U.S. stock daily dataset from 2019 to 2025-12-31. The goal is to build a daily cross-sectional stock-return prediction project using engineered alpha features and a LightGBM model, with later evaluation through IC, Sharpe, PnL, and backtesting metrics.
+**Author:** Xuhui Liu  
+**Affiliation:** Ph.D. Student in Statistics, University of Illinois Urbana-Champaign  
+**Last updated:** April 2026
+
+This project builds an end-to-end daily U.S. equity alpha research pipeline, covering raw CRSP-style daily stock data processing, investable universe construction, 5-day forward return label creation, alpha feature engineering, LightGBM model validation, and 2024--2025 out-of-sample portfolio backtesting. The final validation-selected model is a shallow LightGBM trained on 2019--2023 data and evaluated on 2024--2025. It achieves an out-of-sample daily Rank IC of **0.0207** with a t-statistic of **5.62**. In the best gross backtest case, the long-only top-decile portfolio has a cumulative return of **41.7%**, annualized return of **19.3%**, Sharpe ratio of **1.91**, and maximum drawdown of **-23.3%** before transaction costs. After a 10 bps one-way transaction-cost assumption, the same long-only strategy has a cumulative return of **16.4%**, annualized return of **8.0%**, and Sharpe ratio of **0.86**, showing that the signal is statistically meaningful but highly sensitive to turnover and implementation costs.
 
 ## Table of Contents
 
 - [Data processing](#data-processing)
   - [1. Raw CSV to Parquet conversion](#1-raw-csv-to-parquet-conversion)
-  - [2. Type conversion](#2-type-conversion-and-daily_core-construction)
+  - [2. Type conversion and `daily_core` construction](#2-type-conversion-and-daily_core-construction)
   - [3. Missingness and abnormal-value scan](#3-missingness-and-abnormal-value-scan)
   - [4. Missingness and abnormality investigation](#4-missingness-and-abnormality-investigation)
   - [5. Duplicate stock-date removal](#5-duplicate-stock-date-removal)
@@ -34,20 +38,34 @@ This report summarizes the data-processing and modeling-data construction pipeli
   - [2. Label filtering](#2-label-filtering)
   - [3. Cross-sectional normalization](#3-cross-sectional-normalization)
   - [4. Final model-panel columns](#4-final-model-panel-columns)
-- [Planned first LightGBM experiment](#planned-first-lightgbm-experiment)
+- [Model training, validation, and model selection](#model-training-validation-and-model-selection)
+  - [1. Single-feature IC diagnostics](#1-single-feature-ic-diagnostics)
+  - [2. Feature-score baselines](#2-feature-score-baselines)
+  - [3. Controlled LightGBM validation experiment](#3-controlled-lightgbm-validation-experiment)
+- [Final model training and 2024--2025 backtest](#final-model-training-and-2024--2025-backtest)
+  - [1. Backtesting model panel](#1-backtesting-model-panel)
+  - [2. Test IC](#2-test-ic)
+  - [3. Backtest design and assumptions](#3-backtest-design-and-assumptions)
+  - [4. Backtest result table](#4-backtest-result-table)
+  - [5. Best case and interpretation](#5-best-case-and-interpretation)
+- [Future improvements](#future-improvements)
+  - [1. Data quality and data coverage](#1-data-quality-and-data-coverage)
+  - [2. Alpha design](#2-alpha-design)
+  - [3. Model design](#3-model-design)
+  - [4. Portfolio construction](#4-portfolio-construction)
 
 # Data processing
 
-The data-processing stage converts the raw 8 GB CSV into a typed and queryable daily panel. The goal of this stage is not to build the final model table, but to create a reliable base dataset for universe construction, feature engineering, label construction, and backtesting.
+This section summarizes the data-processing work completed for the U.S. stock daily dataset. The goal of these steps is to convert the raw data into a reliable typed daily panel, diagnose missing and abnormal values, and prepare the data for later universe construction, feature engineering, model training, and backtesting.
 
 ## 1. Raw CSV to Parquet conversion
 
-The raw U.S. stock daily data was originally stored as one large CSV file. Since the file is too large to load directly into pandas, we first converted it into multiple Parquet files.
+The raw U.S. stock daily data from 2019--2026 was originally stored as a large CSV file. Since the file is too large to load directly into pandas, we first converted it into separate Parquet files for efficient downstream processing.
 
-Script:
+The conversion step is implemented in:
 
 ```text
-src/csv_to_parquet.py
+python src/data_processing/csv_to_parquet.py
 ```
 
 Main design choices:
@@ -65,116 +83,160 @@ to:
 data/data_parquet/us_stock_19_26_raw_part_0052.parquet
 ```
 
-- Read all variables as strings during this first conversion step.
-- Avoid pandas automatic type inference because identifier and flag columns such as CUSIP-like fields, CRSP flags, and exchange variables can contain mixed representations.
-- Avoid date/time conversion during this step so that raw values are preserved for controlled casting later.
+- Read all variables as `String` during this first conversion step.
+- Avoid pandas automatic type inference at this stage because columns such as CUSIP-like identifiers and CRSP flags may contain mixed representations.
+- Avoid date/time conversion at this stage to prevent conversion errors and preserve raw values.
 
-This step creates a memory-safe raw Parquet archive that DuckDB can scan efficiently.
+This step produces a memory-safe raw Parquet archive that can be queried efficiently by DuckDB.
 
 ## 2. Type conversion and `daily_core` construction
 
-After raw Parquet conversion, we used DuckDB SQL to cast each variable to its intended type and construct a typed `daily_core` table.
+After the raw Parquet files were created, we used DuckDB SQL queries to process the data and construct a typed `daily_core` table.
 
-Script:
+The processing step is implemented in:
 
 ```text
-src/build_daily_core.py
+python src/data_processing/build_daily_core.py
 ```
 
-Main tasks:
+Main tasks in this step:
 
 - Read all 52 raw Parquet files using DuckDB.
 - Normalize variable names to lowercase.
-- Use the CRSP variable dictionary to assign intended types such as integer, double/decimal, date, and character.
-- Cast each raw string column into its intended type.
+- Use the CRSP variable dictionary to assign each variable to an intended type, such as:
+  - integer
+  - decimal / double
+  - date
+  - character
+- Cast each variable from raw string format into its intended type.
 - Preserve all original variables from the raw data.
-- Preserve the raw CRSP price field `dlyprc`.
-- Create a price magnitude variable `prc` from `dlyprc` for downstream analysis and universe construction.
-- Add a flag for negative raw CRSP prices, because negative CRSP prices are a data convention rather than economically negative prices.
+- Keep the raw CRSP price variable `dlyprc` unchanged.
+<!-- - Create a cleaned price magnitude variable:
 
-For casting failures, non-empty raw values that failed conversion would be saved separately for manual inspection. In the actual run, all casting was successful.
+```text
+prc = ABS(dlyprc)
+```
 
-Output:
+- Add a flag indicating whether the raw CRSP price was negative:
+
+```text
+dlyprc_negative_flag
+```
+
+This is important because negative CRSP prices are often a data convention indicating bid/ask average prices, not economically negative prices. -->
+
+For casting failures:
+
+- If a non-empty raw value failed to cast into the intended type, the row would be saved separately for manual inspection.
+- In the actual run, all casting was successful.
+
+Output from this step:
 
 ```text
 data/clean_parquet/daily_core/
 ```
 
-The resulting `daily_core` table is a typed, mostly lossless daily stock panel. It is not yet a trading universe.
+The resulting `daily_core` table is a typed, mostly lossless daily stock panel. It is not yet filtered into a trading universe.
 
 ## 3. Missingness and abnormal-value scan
 
-After constructing `daily_core`, we scanned each variable for missingness and abnormal values.
+After constructing `daily_core`, we scanned each variable for missing values and abnormal values.
 
-Script:
+This step is implemented in:
 
 ```text
-src/scan_missing_abnormal.py
+python src/diagnose/scan_missing_abnormal.py
 ```
 
-Main outputs:
+Main tasks in this step:
+
+- Use DuckDB to scan the full `daily_core` table.
+- For each variable, compute:
+  - total number of rows
+  - missing count
+  - missing percentage
+  - abnormal count
+  - abnormal percentage
+  - abnormal rule used, if applicable
+- Save the resulting summary table as:
 
 ```text
 data/clean_parquet/daily_core_missing_abnormal_report.csv
 ```
 
-For each variable, the scan reports:
+Selected rows from the missing/abnormal report:
 
-- total number of rows,
-- missing count,
-- missing percentage,
-- abnormal count,
-- abnormal percentage,
-- abnormal rule used.
+| variable | type | total rows | missing count | missing % | abnormal count | abnormal % | abnormal rule |
+|---|---|---:|---:|---:|---:|---:|---|
+| `disfacpr` | decimal | 15,749,137 | 15,553,778 | 98.7596% | 5,986 | 0.0380% | `disfacpr < 0` |
+| `disfacshr` | decimal | 15,749,137 | 15,553,778 | 98.7596% | 5,985 | 0.0380% | `disfacshr < 0` |
+| `dlyprc` | decimal | 15,749,137 | 47,018 | 0.2985% | 5,426 | 0.0345% | `ABS(dlyprc) <= 0 OR ABS(dlyprc) > 100000` |
+| `prc` | decimal | 15,749,137 | 47,018 | 0.2985% | 5,426 | 0.0345% | `prc <= 0 OR prc > 100000` |
+| `dlyclose` | decimal | 15,749,137 | 386,149 | 2.4519% | 1,760 | 0.0112% | `dlyclose <= 0 OR dlyclose > 100000` |
+| `dlylow` | decimal | 15,749,137 | 386,149 | 2.4519% | 1,760 | 0.0112% | `dlylow <= 0 OR dlylow > 100000` |
+| `dlyhigh` | decimal | 15,749,137 | 386,149 | 2.4519% | 1,760 | 0.0112% | `dlyhigh <= 0 OR dlyhigh > 100000` |
+| `dlyopen` | decimal | 15,749,137 | 386,146 | 2.4519% | 1,760 | 0.0112% | `dlyopen <= 0 OR dlyopen > 100000` |
+| `dlyask` | decimal | 15,749,137 | 51,628 | 0.3278% | 1,760 | 0.0112% | `dlyask < 0 OR dlyask > 100000` |
+| `dlybid` | decimal | 15,749,137 | 51,625 | 0.3278% | 1,760 | 0.0112% | `dlybid < 0 OR dlybid > 100000` |
+| `dlyret` | decimal | 15,749,137 | 54,680 | 0.3472% | 2 | 0.000013% | `dlyret < -1 OR dlyret > 20` |
+| `dlyretx` | decimal | 15,749,137 | 54,680 | 0.3472% | 2 | 0.000013% | `dlyretx < -1 OR dlyretx > 20` |
+| `disdivamt` | decimal | 15,749,137 | 15,556,843 | 98.7790% | 1 | 0.000006% | `disdivamt < 0` |
+| `dlynumtrd` | int | 15,749,137 | 9,039,956 | 57.3997% | 0 | 0.0000% | `dlynumtrd < 0` |
+| `exchangetier` | char | 15,749,137 | 9,035,459 | 57.3711% | 0 | 0.0000% | none |
+| `dlymmcnt` | int | 15,749,137 | 9,035,459 | 57.3711% | 0 | 0.0000% | `dlymmcnt < 0` |
+| `shareclass` | char | 15,749,137 | 14,096,039 | 89.5036% | 0 | 0.0000% | none |
 
-Selected results from the scan:
-
-| variable | total rows | missing count | missing % | abnormal count | abnormal % | interpretation |
-|---|---:|---:|---:|---:|---:|---|
-| `dlyprc` / `prc` | 15,749,137 | 47,018 | 0.2985% | 5,426 | 0.0345% | Missing/zero prices are mostly non-tradable or terminal rows; very high prices include valid stocks such as BRK.A. |
-| `dlyopen`, `dlyhigh`, `dlylow`, `dlyclose` | 15,749,137 | about 386,000 | about 2.45% | 1,760 | about 0.011% | OHLC missingness is often structural and related to non-trading or quote-priced rows. |
-| `dlybid`, `dlyask` | 15,749,137 | about 51,600 | about 0.328% | 1,760 | about 0.011% | Mostly non-tradable or abnormal quote records. |
-| `dlyret`, `dlyretx` | 15,749,137 | 54,680 | 0.3472% | 2 | 0.000013% | Missing returns are explained by CRSP return-missing flags. |
-| distribution variables | 15,749,137 | about 98.7% missing | high | low | low | Distribution fields are event-specific; missing usually means no distribution event. |
-| `dlynumtrd`, `dlymmcnt`, `exchangetier` | 15,749,137 | about 57% missing | high | 0 | 0% | These fields have limited coverage and should be optional, not mandatory. |
-
-This scan provided a global view. It did not by itself determine whether a value was unusable, because many missing values are structural rather than errors.
+This scan gives a global view of missingness and abnormality, but it does not by itself determine whether a value is invalid. Many missing values are structural, especially for event-specific variables such as distribution and delisting fields.
 
 ## 4. Missingness and abnormality investigation
 
-We then manually investigated missingness and abnormal values for key variable groups.
+After generating the missing/abnormal report, we manually investigated the reason for missingness and abnormality for important variable groups.
 
-Script:
+This step is implemented in:
 
 ```text
-src/investigate_missing_examples.py
+python src/diagnose/investigate_missing_examples.py
 ```
 
 The investigation script supports:
 
-- random sampling of rows where a variable is missing,
-- printing all columns for sampled rows,
-- grouped missingness summaries by variables such as `year`, `primaryexch`, `securitytype`, `sharetype`, and `tradingstatusflg`,
-- abnormal-example extraction,
-- CSV export for manual inspection.
+- Randomly sampling rows where a given variable is missing.
+- Printing all columns for each sampled row so that the surrounding context can be inspected.
+- Summarizing missingness by groups such as:
+  - `year`
+  - `primaryexch`
+  - `securitytype`
+  - `sharetype`
+  - `tradingstatusflg`
+- Randomly sampling abnormal rows for a given variable.
+- Saving both examples and grouped summaries to CSV files.
 
-Detailed reports:
+The detailed investigation reports are stored in:
 
 ```text
 missing_investigation.md
 abnormal_investigation.md
 ```
 
-Main conclusions:
+Main conclusions from the missingness investigation:
 
-- OHLC variables are often missing together. Many such rows still have valid `dlyprc`, especially when the price is based on bid/ask quotes. These rows should generally be kept and handled with feature-level indicators rather than automatically dropped.
-- Missing `prc` is more serious because `prc` is required for tradability, market-cap logic, and dollar-volume logic.
-- Missing bid/ask fields are mostly concentrated in inactive, suspended, halted, or delisting rows. In the final universe, bid/ask missingness is very rare.
-- Missing `dlyvol`, `dlycap`, and `dlyprcvol` is mostly associated with non-tradable or terminal rows. `dlyvol` and `dlycap` are essential for universe construction.
-- Missing return variables are mostly associated with non-trading or inactive rows. Active rows with missing returns should not be imputed as zero.
-- Distribution-event variables are mostly missing because most stock-days do not have dividends, splits, or other distribution events. Missingness should generally be interpreted as no recorded event.
-- Abnormal high `prc` values are not automatically errors; valid high-priced stocks such as Berkshire Hathaway Class A can exceed simple abnormal thresholds.
-- Extreme `dlyret` values were rare and internally explainable by major price changes. They are kept in the raw return source.
+- OHLC variables (`dlyopen`, `dlyhigh`, `dlylow`, `dlyclose`) are often missing together. Many of these rows still have valid `dlyprc`, especially when the price comes from bid/ask quotes. These rows should generally be kept with indicators rather than dropped automatically.
+- Missing `prc` is more serious because `prc = ABS(dlyprc)`. Rows with missing or zero `prc` generally cannot be used as day-*t* trading candidates.
+- Missing bid/ask variables are mostly concentrated in inactive, suspended, halted, or delisting rows. For active rows, bid/ask missingness is rare and can be handled with a missingness flag.
+- Missing `dlyvol`, `dlycap`, and `dlyprcvol` is rare and mostly occurs in non-tradable or terminal rows. These variables are essential for universe preparation, so rows missing them are not suitable as trading candidates.
+- Missing return variables (`dlyret`, `dlyretx`, `dlyreti`) are mostly associated with non-trading or inactive rows. Active rows with missing returns should not have returns imputed as zero.
+- Variables such as `dlynumtrd`, `dlymmcnt`, and `exchangetier` have high missingness, but this reflects limited field coverage rather than data failure. They should be optional microstructure variables, not mandatory universe filters.
+- Distribution-event variables are mostly missing because most stock-date rows do not have a dividend, split, or other distribution event. Missingness should generally be interpreted as no recorded event.
+- Delisting-related variables are event metadata and should not be used as mandatory filters by themselves.
+
+Main conclusions from the abnormal-value investigation:
+
+- Abnormal `dlyprc` values split into two cases: zero-price terminal/delisting rows and valid high-priced active equities. High prices above 100,000 should not be treated as invalid by themselves.
+- Negative `disfacpr` values are usually legitimate corporate-action records, including delisting distributions and reverse-split-style events.
+- The two abnormal `dlyret` rows are internally consistent extreme price jumps and should be preserved in `daily_core`; they may need special handling during model training.
+- The single negative `disdivamt` row appears to be a corporate-action adjustment record, not a systematic data-quality problem.
+
+The purpose of this investigation was not to directly build the final universe. Instead, it determined how each type of missing or abnormal value should be handled later during universe preparation, feature engineering, model training, and backtesting.
 
 ## 5. Duplicate stock-date removal
 
@@ -183,7 +245,7 @@ Before label construction and feature engineering, we created a de-duplicated co
 Script:
 
 ```text
-src/label_creation_screening.py
+python src/data_processing/label_creation_screening.py
 ```
 
 Output:
@@ -224,7 +286,7 @@ The previous intermediate `prepare_universe_base.py` workflow has been retired. 
 Script:
 
 ```text
-src/create_daily_universe.py
+python src/create_universe/create_daily_universe.py
 ```
 
 Output:
@@ -277,7 +339,7 @@ After constructing `daily_stock_universe`, we checked missingness and abnormalit
 Script:
 
 ```text
-src/scan_universe_missing_abnormal.py
+python src/diagnose/scan_universe_missing_abnormal.py
 ```
 
 Outputs:
@@ -309,7 +371,7 @@ The universe is usable. Remaining missingness is small and should be handled in 
 Script:
 
 ```text
-src/diagnose_universe_edge_case.py
+python src/diagnose/diagnose_universe_edge_case.py
 ```
 
 Main findings:
@@ -319,9 +381,7 @@ Main findings:
 - There are four rows where `dlybid` or `dlyask` is missing while core price, volume, and return fields are valid.
 - There is one OHLC inconsistency:
 
-```text
-2023-06-05, JOBY: open=5.72, high=6.09, low=5.76, close=5.99
-```
+One OHLC inconsistency was detected in the universe-level diagnostics. The row was kept for return and backtest purposes, but OHLC-derived features are invalidated when open/high/low/close fields are internally inconsistent.
 
 Here `open < low`. We keep the row for return and backtest purposes, but OHLC-derived features should be invalidated or set to missing for this row.
 
@@ -346,7 +406,7 @@ The label and backtesting stage creates future-return outcomes from the broad re
 Script:
 
 ```text
-src/create_backtesting_data.py
+python src/create_backtest_data/create_backtesting_data.py
 ```
 
 Output:
@@ -437,7 +497,7 @@ Feature engineering creates compact engineered features from the broad de-duplic
 Script:
 
 ```text
-src/create_features.py
+python src/create_features/create_features.py
 ```
 
 Output:
@@ -577,7 +637,7 @@ The model panel combines the universe, the training label, and engineered featur
 Script:
 
 ```text
-src/create_model_panel.py
+python src/create_model_panel/create_model_panel.py
 ```
 
 Output:
@@ -708,24 +768,274 @@ The target metadata is saved to:
 data/clean_parquet/model_panel_analysis/model_panel_target_column.csv
 ```
 
-# Planned first LightGBM experiment
+# Model training, validation, and model selection
 
-The next planned step is to train a baseline LightGBM model.
-
-Recommended split:
+After constructing the model panel, we used a time-series split rather than a random split. This is necessary because stock-return prediction is a temporal forecasting problem, and random splitting would leak future market regimes into training.
 
 | split | years | purpose |
 |---|---|---|
-| training | 2019--2022 | Fit model parameters. |
-| validation | 2023 | Tune hyperparameters and inspect IC. |
-| out-of-sample test / backtest | 2024--2025 | Final performance evaluation after model choices are fixed. |
+| training | 2019--2022 | Fit candidate models and select stable features. |
+| validation | 2023 | Select feature subsets and LightGBM hyperparameters. |
+| out-of-sample test / backtest | 2024--2025 | Final evaluation after the model pipeline is fixed. |
 
-Because the response is a 5-day forward return, the last 5 trading dates near split boundaries should be removed from the training or validation split when necessary to avoid label-window leakage across periods.
+Because the label is a forward 5-trading-day return, we remove the last 5 trading dates at relevant split boundaries. In particular, the last 5 trading dates of 2022 are removed when training models validated on 2023, and the last 5 trading dates of 2023 are removed when training the final 2019--2023 model for 2024--2025 backtesting. This prevents label windows from crossing into the next evaluation period.
 
-The first evaluation should focus on:
+## 1. Single-feature IC diagnostics
 
-- validation daily Rank IC,
-- mean IC,
-- ICIR,
-- feature importance,
-- later 2024--2025 portfolio backtest using `backtesting_data` return scenarios.
+Script:
+
+```text
+python src/train_model/compute_single_feature_ic.py
+```
+
+Before tuning complex models, we computed daily single-feature Rank IC for every model feature. This diagnostic showed that the feature set contains real predictive information: the best single-feature validation Rank IC in 2023 reached about **0.0263**. This means the weak performance of the first all-feature model was not simply caused by an empty or useless feature set.
+
+The strongest signals were mostly related to size, liquidity, bid-ask spread, illiquidity, volatility, and high-low range. This suggests that the first-generation alpha set is capturing a broad liquidity/risk/style effect more than a diverse set of independent alpha sources.
+
+## 2. Feature-score baselines
+
+Script:
+
+```text
+python src/train_model/compute_feature_score_baselines.py
+```
+
+We then tested simple signed feature-score baselines. Features were selected using only the 2019--2022 training-period IC table, and feature directions were assigned according to the sign of training-period IC. This avoids selecting features directly from the 2023 validation period.
+
+The best simple feature-score baseline achieved validation Rank IC around **0.020** in 2023. This confirmed that some features remain predictive out of sample, but it also showed that naively adding more correlated features can reduce performance. In other words, the signals combine imperfectly and require careful model regularization.
+
+## 3. Controlled LightGBM validation experiment
+
+Script:
+
+```text
+python src/train_model/train_lgbm_baseline.py
+```
+
+Given the feature diagnostics, we moved away from a large all-feature LightGBM and instead trained controlled shallow LightGBM models using only the top stable features selected from 2019--2022. We tested top-K feature sets and strongly regularized tree settings.
+
+The best validation model was:
+
+```text
+top20_medium_l2_20_leaf15
+```
+
+Main setup:
+
+| item | value |
+|---|---|
+| feature set | top 20 stable features selected from 2019--2022 single-feature IC |
+| training period | 2019--2022 |
+| validation period | 2023 |
+| objective | LightGBM regression with MSE/RMSE metric |
+| learning rate | 0.02 |
+| number of leaves | 15 |
+| max depth | 4 |
+| min data in leaf | 2000 |
+| L2 regularization | 20 |
+| feature fraction | 0.9 |
+| bagging fraction | 0.8 |
+| best iteration | 28 |
+| validation daily Rank IC | 0.02453 |
+
+This validation result beat the simple feature-score baseline and became the chosen model pipeline for final testing.
+
+# Final model training and 2024--2025 backtest
+
+After selecting the model pipeline using 2023 validation data, we froze the setup and trained the final model using all available pre-test data from 2019--2023.
+
+Final training script:
+
+```text
+python src/train_model/train_final_lgbm_for_backtest.py
+```
+
+Backtesting script:
+
+```text
+python src/backtest/run_backtest.py
+```
+
+The final model is saved under:
+
+```text
+model_outputs/lgbm_final_top20_train_2019_2023_for_backtest/
+```
+
+The backtest result is saved under:
+
+```text
+backtest_result/lgbm_final_top20_train_2019_2023_test_2024_2025/
+```
+
+## 1. Backtesting model panel
+
+For backtesting, we created a separate `backtesting_model_panel` rather than using the complete-label-only training panel.
+
+Script:
+
+```text
+python src/create_backtest_data/create_backtesting_model_panel.py
+```
+
+The backtesting panel is rooted in the daily universe and joins:
+
+- model features from `daily_features`,
+- complete-only label `target_5d_raw_complete_only` and `target_5d_cs_zscore` for test IC evaluation,
+- backtesting return columns from `backtesting_data` for portfolio PnL.
+
+The test IC uses:
+
+```text
+target_5d_cs_zscore
+```
+
+The portfolio backtest uses realized 5-day backtesting returns, not the standardized label.
+
+## 2. Test IC
+
+The final model achieved the following 2024--2025 out-of-sample IC performance:
+
+| metric | value |
+|---|---:|
+| prediction rows | 1,197,404 |
+| IC rows | 1,184,295 |
+| unique dates | 502 |
+| overall Spearman IC | 0.0214 |
+| daily Rank IC mean | 0.0207 |
+| daily Rank IC standard deviation | 0.0822 |
+| daily Rank IC t-stat | 5.62 |
+| daily Rank IC positive fraction | 63.18% |
+
+The test daily Rank IC is about **0.0207**, with a t-stat of **5.62**, indicating that the model has a statistically meaningful out-of-sample ranking signal.
+
+## 3. Backtest design and assumptions
+
+The strategy is a daily-rebalanced, overlapping 5-day holding-period strategy designed to match the 5-day prediction horizon.
+
+Main assumptions:
+
+| component | design |
+|---|---|
+| signal | LightGBM prediction score from the final top-20 model |
+| test period | 2024--2025 |
+| ranking | daily cross-sectional ranking within the stock universe |
+| long-only portfolio | long the top 10% predicted stocks |
+| long-short portfolio | long top 10%, short bottom 10% |
+| weighting | equal weight within selected long and short legs |
+| holding period | 5 trading days |
+| sleeve design | 5 overlapping sleeves; each day opens a new 5-day sleeve and closes the sleeve opened 5 trading days earlier |
+| total gross exposure | 1.0 |
+| long-short exposure | +0.5 long, -0.5 short in steady state |
+| long-only exposure | +1.0 long in steady state |
+| NAV convention | initial NAV = 1.0 |
+| reporting capital | $1,000,000 notional for dollar PnL interpretation |
+| transaction costs | 0, 5, 10, and 20 bps one-way cost |
+
+The backtest is currently a realized 5-day sleeve backtest. It is appropriate as a first evaluation for a 5-day prediction model, but it is not yet a full daily mark-to-market position-level simulation.
+
+## 4. Backtest result table
+
+The table below reports the severe delisting-stress return definition:
+
+```text
+bt_5d_return_delist_stress_100
+```
+
+The no-stress and -30% delisting-stress cases were effectively identical in this run, because selected universe stocks rarely had delisting-related missing forward returns.
+
+| strategy | one-way cost | cumulative return | annualized return | annualized volatility | Sharpe | max drawdown | final NAV |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `long_only` | 0 bps | 41.66% | 19.31% | 9.47% | 1.91 | -23.30% | 1.4166 |
+| `long_only` | 5 bps | 28.39% | 13.51% | 9.47% | 1.39 | -24.58% | 1.2839 |
+| `long_only` | 10 bps | 16.36% | 7.99% | 9.47% | 0.86 | -25.84% | 1.1636 |
+| `long_only` | 20 bps | -4.42% | -2.27% | 9.46% | -0.19 | -28.30% | 0.9558 |
+| `long_short` | 0 bps | -1.66% | -0.85% | 4.28% | -0.18 | -13.65% | 0.9834 |
+| `long_short` | 5 bps | -10.88% | -5.67% | 4.28% | -1.34 | -15.85% | 0.8912 |
+| `long_short` | 10 bps | -19.23% | -10.26% | 4.28% | -2.51 | -21.23% | 0.8077 |
+| `long_short` | 20 bps | -33.67% | -18.79% | 4.28% | -4.84 | -34.86% | 0.6633 |
+
+## 5. Best case and interpretation
+
+The best case is the **long-only portfolio with 0 bps transaction cost**:
+
+| metric | value |
+|---|---:|
+| cumulative return | 41.66% |
+| annualized return | 19.31% |
+| annualized volatility | 9.47% |
+| Sharpe | 1.91 |
+| max drawdown | -23.30% |
+| final NAV | 1.4166 |
+| PnL on $1,000,000 notional | $416,597 |
+
+This result is encouraging because the model has real test-period Rank IC and the long-only gross portfolio has a strong Sharpe. However, the performance is highly sensitive to transaction costs. At 10 bps one-way cost, the long-only cumulative return drops to **16.36%** and the annualized return drops to **7.99%**. At 20 bps, the long-only strategy becomes negative.
+
+The long-short portfolio is weak even before costs. This suggests that the model is better at selecting relatively attractive long candidates than at identifying a profitable short basket. The current signal should therefore be viewed as a long-only ranking signal rather than a robust dollar-neutral long-short alpha.
+
+# Future improvements
+
+The current project successfully builds a full data-processing, feature-engineering, model-training, and backtesting pipeline. It also finds a statistically meaningful out-of-sample Rank IC. However, the portfolio result is not yet strong enough to claim a practical trading strategy after realistic transaction costs. Future work should improve the project in four directions.
+
+## 1. Data quality and data coverage
+
+The current dataset contains daily CRSP-style price, return, volume, quote, share, and corporate-action variables. This is useful for building a clean cross-sectional baseline, but the data source is limited.
+
+Important missing data categories include:
+
+- company fundamentals,
+- analyst forecasts and revisions,
+- earnings events and guidance,
+- short interest and institutional ownership,
+- news and sentiment data,
+- intraday order-book and trade data,
+- sector-level and macro variables.
+
+Without company-specific and event-specific information, the model mostly learns broad size, liquidity, volatility, and microstructure effects. Adding richer data could help create more independent and economically interpretable alpha signals.
+
+## 2. Alpha design
+
+The current alpha design is intentionally simple. Most features are basic return-history, volatility, liquidity, range, and price-pressure variables. The single-feature IC analysis shows that some of them are predictive, but many are highly correlated with each other.
+
+Current limitations:
+
+- many features measure similar liquidity/risk effects,
+- feature diversity is limited,
+- there are few fundamental or event-driven signals,
+- the signal is not strong enough to survive high turnover and high cost assumptions,
+- the short side does not work well.
+
+Future feature work should focus on more differentiated alpha families, such as event-based features, industry-relative features, residualized style factors, regime-conditioned features, and interaction features that are motivated by market microstructure or behavioral hypotheses.
+
+## 3. Model design
+
+The current best model is a shallow LightGBM trained with MSE/RMSE objective. LightGBM is a good first choice because it is fast, interpretable, robust on tabular data, and easier to regularize than deep learning models.
+
+However, the model is not yet optimized for portfolio performance. Future directions include:
+
+- changing the objective from MSE to a more rank-oriented or portfolio-oriented loss,
+- adding an IC-like term to the loss function,
+- testing pairwise or listwise ranking objectives,
+- adding monotonic constraints for features with stable economic directions,
+- using rolling or expanding-window retraining instead of a single static model,
+- testing deep learning models such as LSTM, temporal convolution, Transformer, or attention-based architectures with strong overfitting control.
+
+More complex models should only be adopted if they improve out-of-sample IC and portfolio performance after transaction costs.
+
+## 4. Portfolio construction
+
+The current portfolio construction is deliberately simple and has very high turnover. The average daily turnover is about **39.6%**, which causes transaction costs to dominate performance.
+
+Future improvements should focus on lowering turnover and improving implementation realism:
+
+- rebalance weekly instead of daily,
+- trade only when rank changes are large enough,
+- add no-trade bands around current holdings,
+- test different long proportions such as top 5%, top 10%, and top 20%,
+- compare long-only returns against S&P 500 and equal-weight universe benchmarks,
+- report long-only excess return rather than only raw return,
+- add sector, beta, size, volatility, and liquidity exposure diagnostics,
+- add position-level daily mark-to-market returns instead of only realized 5-day sleeve returns,
+- add capacity constraints such as maximum position size and maximum ADV participation.
+
+The main next practical goal is to preserve the test Rank IC around 0.02 while reducing turnover enough that the strategy remains attractive under 10 bps one-way transaction cost.
